@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for routine bumps; @google/genai moves fast and is called out
+      # separately below since it's the only dep whose API we depend on deeply.
+      minor-and-patch:
+        update-types: [minor, patch]
+        exclude-patterns: ['@google/genai']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

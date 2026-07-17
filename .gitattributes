@@ -1,0 +1,11 @@
+# Normalise to LF in the repository *and* in the working tree, on every platform.
+#
+# index.js is the published `gemi` binary and opens with a shebang. Checked out
+# through core.autocrlf=true on Windows it would gain CRLF, and `npm publish`
+# from that clone ships "#!/usr/bin/env node\r" -- which Linux and macOS reject
+# with "bad interpreter: /usr/bin/env node^M".
+#
+# CI cannot catch this for us: the Unix runners check out LF whatever the
+# author's setting, and the Windows job runs the bin through an npm-generated
+# .cmd shim that never reads the shebang. So it is pinned here instead.
+* text=auto eol=lf

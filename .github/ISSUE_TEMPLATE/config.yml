@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Gemini Interactions API docs
+    url: https://ai.google.dev/gemini-api/docs/interactions-overview
+    about: Questions about the API itself, model behaviour, quotas or retention.
+  - name: Get a free API key
+    url: https://aistudio.google.com/apikey
+    about: gemi needs a GEMINI_API_KEY. It's free and needs no billing account.
+  - name: Security issue
+    url: https://github.com/Booyaka101/gemi-research-daemon/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue.

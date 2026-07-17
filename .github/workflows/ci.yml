@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      # The suite runs the real CLI against a mock Interactions API on
+      # localhost. No GEMINI_API_KEY is needed, so this is safe on forks.
+      - run: npm test
+
+  package:
+    name: package contents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      # Catches a broken bin entry or a missing file in `files` before a
+      # release does.
+      - run: npm pack --dry-run
+
+      - name: gemi runs from a packed tarball
+        run: |
+          npm pack
+          npm install -g ./gemi-research-daemon-*.tgz
+          gemi --version
+          gemi --help
+          gemi list

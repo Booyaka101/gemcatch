@@ -1,0 +1,51 @@
+name: Bug report
+description: Something didn't work the way it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please **never paste your API key** — check any
+        command output you copy in here for it first.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, and what came back.
+      placeholder: |
+        $ gemi get 8f3a1c04
+        Error: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: gemi version
+      description: Output of `gemi --version`
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node version and OS
+      description: Output of `node --version`, plus your OS.
+      placeholder: v22.18.0 on Windows 11
+    validations:
+      required: true
+
+  - type: textarea
+    id: stats
+    attributes:
+      label: gemi stats
+      description: Optional, but it tells us where your store is and what's in it.
+      render: shell

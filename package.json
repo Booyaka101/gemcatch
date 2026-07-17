@@ -1,0 +1,52 @@
+{
+  "name": "gemi-research-daemon",
+  "version": "0.1.0",
+  "description": "Fire-and-forget CLI for Gemini's Interactions API background execution. Submit long-running research prompts, close your laptop, collect results later.",
+  "main": "index.js",
+  "bin": {
+    "gemi": "index.js"
+  },
+  "files": [
+    "index.js",
+    "db.js",
+    "gemini.js",
+    "status.js",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test-offline.js",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "gemini",
+    "gemini-api",
+    "interactions-api",
+    "background",
+    "async",
+    "agents",
+    "cli",
+    "research",
+    "daemon",
+    "google-ai"
+  ],
+  "license": "MIT",
+  "author": "Booyaka101",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Booyaka101/gemi-research-daemon.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Booyaka101/gemi-research-daemon/issues"
+  },
+  "homepage": "https://github.com/Booyaka101/gemi-research-daemon#readme",
+  "dependencies": {
+    "@google/genai": "^2.12.0",
+    "better-sqlite3": "^12.11.1",
+    "commander": "^15.0.0"
+  }
+}

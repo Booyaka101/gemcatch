@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest something gemi should do
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `gemi` deliberately does one thing: get background results back from the
+        Interactions API without you babysitting them. Ideas that sharpen that
+        are very welcome; ideas that turn it into a general Gemini client
+        probably belong in a different tool.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The situation, not the solution. What got in your way?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do?
+      placeholder: |
+        $ gemi research "..." --something
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What are you doing instead today?
+    validations:
+      required: false

@@ -1,0 +1,17 @@
+node_modules/
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/settings.local.json
+*.tgz
+coverage/
+.env
+.env.*
+# Local task store, if anyone points GEMI_HOME at the repo.
+.gemi/
+tasks.db
+tasks.db-wal
+tasks.db-shm
