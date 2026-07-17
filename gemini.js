@@ -3,11 +3,11 @@
 const { isDone, isSuccess } = require('./status');
 
 // Free of charge on the Gemini free tier; override per-call with --model.
-const DEFAULT_MODEL = process.env.GEMI_MODEL || 'gemini-3.1-flash-lite';
+const DEFAULT_MODEL = process.env.GEMCATCH_MODEL || 'gemini-3.1-flash-lite';
 
 // Overridable for tests and for routing via a proxy/gateway.
 const REST_BASE =
-  process.env.GEMI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/interactions';
+  process.env.GEMCATCH_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/interactions';
 
 function envNum(name, dflt) {
   const raw = process.env[name];
@@ -19,10 +19,10 @@ function envNum(name, dflt) {
 // The free tier allows ~15 requests/minute. Capping *concurrency* does not cap
 // a rate, so every outbound call goes through gate() below instead. 0 disables
 // it -- paid keys, gateways, and the test suite.
-const RPM = envNum('GEMI_RPM', 15);
+const RPM = envNum('GEMCATCH_RPM', 15);
 
-const MAX_RETRIES = envNum('GEMI_MAX_RETRIES', 4);
-const RETRY_BASE_MS = envNum('GEMI_RETRY_BASE_MS', 500);
+const MAX_RETRIES = envNum('GEMCATCH_MAX_RETRIES', 4);
+const RETRY_BASE_MS = envNum('GEMCATCH_RETRY_BASE_MS', 500);
 const RETRY_CEIL_MS = 30000;
 
 const KEY_HELP =
@@ -191,9 +191,9 @@ function shape(r) {
 let _api;
 
 function sdkInteractions() {
-  // GEMI_FORCE_REST exercises the raw-fetch fallback without uninstalling the
+  // GEMCATCH_FORCE_REST exercises the raw-fetch fallback without uninstalling the
   // SDK. Checked every call so it always wins over the memo below.
-  if (process.env.GEMI_FORCE_REST === '1') return null;
+  if (process.env.GEMCATCH_FORCE_REST === '1') return null;
   if (_api !== undefined) return _api;
   let GoogleGenAI;
   try {

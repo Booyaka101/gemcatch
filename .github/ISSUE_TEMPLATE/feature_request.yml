@@ -1,11 +1,11 @@
 name: Feature request
-description: Suggest something gemi should do
+description: Suggest something gemcatch should do
 labels: [enhancement]
 body:
   - type: markdown
     attributes:
       value: |
-        `gemi` deliberately does one thing: get background results back from the
+        `gemcatch` deliberately does one thing: get background results back from the
         Interactions API without you babysitting them. Ideas that sharpen that
         are very welcome; ideas that turn it into a general Gemini client
         probably belong in a different tool.
@@ -23,7 +23,7 @@ body:
     attributes:
       label: What would you like it to do?
       placeholder: |
-        $ gemi research "..." --something
+        $ gemcatch research "..." --something
     validations:
       required: false
 

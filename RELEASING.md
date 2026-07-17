@@ -36,11 +36,11 @@ Add `<you@example.com>` if you want to be reachable directly.
 `CODE_OF_CONDUCT.md` routes conduct reports through the same private form as
 `SECURITY.md` rather than an email address, so nothing scrapable goes on a
 public repo and there is no alias to retire later. Swap in a dedicated address
-(`gemi-conduct@yourdomain`) if you'd rather have one.
+(`gemcatch-conduct@yourdomain`) if you'd rather have one.
 
 ### 4. License attribution
 
-`LICENSE` reads `Copyright (c) 2026 gemi-research-daemon contributors`. That's a
+`LICENSE` reads `Copyright (c) 2026 gemcatch contributors`. That's a
 real and common convention, but if you'd rather it carry your name, change it
 now — it's harder once other people have contributed.
 
@@ -49,7 +49,7 @@ now — it's harder once other people have contributed.
 **Publish to npm, then post it as a reply in the comments of the July 7
 background-execution announcement and its HN/Reddit threads.**
 
-The npm publish is the blocking prerequisite — `npx gemi-research-daemon` *is*
+The npm publish is the blocking prerequisite — `npx gemcatch` *is*
 the pitch, and the name is currently unregistered.
 
 Then go where the pain already is. Everyone reading that announcement just
@@ -63,7 +63,7 @@ that makes the tool make sense.
 Lead with the one-liner, not the repo:
 
 ```
-npx gemi-research-daemon research "your question"
+npx gemcatch research "your question"
 ```
 
 ## Publish
@@ -74,11 +74,11 @@ npm pack --dry-run          # confirm the tarball contents
 npm publish --access public
 ```
 
-The name `gemi-research-daemon` was unregistered on npm as of 2026-07-17. Verify
+The name `gemcatch` was unregistered on npm as of 2026-07-17. Verify
 before you count on it:
 
 ```bash
-npm view gemi-research-daemon version
+npm view gemcatch version
 # E404 means it's still free
 ```
 
@@ -89,7 +89,7 @@ Publishing needs an npm account (`npm login`). The package is public and free.
 The repo is initialised on `main` with an initial commit, but has no remote:
 
 ```bash
-gh repo create gemi-research-daemon --public --source=. --push
+gh repo create gemcatch --public --source=. --push
 ```
 
 CI runs on push and needs no secrets: the test suite mocks the API, so it works
@@ -98,7 +98,7 @@ on forks and without a `GEMINI_API_KEY`.
 ## A note on line endings
 
 `.gitattributes` pins the whole tree to `eol=lf`. Don't relax that. `index.js`
-is the published `gemi` binary and starts with a shebang; checked out with CRLF
+is the published `gemcatch` binary and starts with a shebang; checked out with CRLF
 (the default on Windows, where `core.autocrlf=true`) it publishes as
 `#!/usr/bin/env node\r`, which Linux and macOS reject with "bad interpreter".
 
@@ -107,7 +107,7 @@ Windows job runs the bin through an npm `.cmd` shim that never reads the
 shebang. If you ever suspect it, check the tarball itself rather than the repo:
 
 ```bash
-npm pack && tar -xzOf gemi-research-daemon-*.tgz package/index.js | head -c 20 | xxd | head -2
+npm pack && tar -xzOf gemcatch-*.tgz package/index.js | head -c 20 | xxd | head -2
 # 0d anywhere in that shebang line means it is broken for Unix users
 ```
 
@@ -126,14 +126,14 @@ real round-trip is worth doing by hand before a release that touches
 
 ```bash
 export GEMINI_API_KEY=...        # free: https://aistudio.google.com/apikey
-export GEMI_HOME=/tmp/gemi-smoke
+export GEMCATCH_HOME=/tmp/gemcatch-smoke
 node index.js research "name three colours" -w
 node index.js research "name three animals"     # leave one in flight...
 node index.js daemon --exit-when-idle -i 15     # ...and let the daemon collect it
 node index.js stats
 ```
 
-Do it once with `GEMI_FORCE_REST=1` too — that exercises the raw-fetch fallback,
+Do it once with `GEMCATCH_FORCE_REST=1` too — that exercises the raw-fetch fallback,
 which has a genuinely different response shape (no `output_text`; the text has
 to be recovered from `steps`).
 

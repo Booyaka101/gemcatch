@@ -1,7 +1,7 @@
-# gemi
+# gemcatch
 
-[![CI](https://github.com/Booyaka101/gemi-research-daemon/actions/workflows/ci.yml/badge.svg)](https://github.com/Booyaka101/gemi-research-daemon/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/gemi-research-daemon.svg)](https://www.npmjs.com/package/gemi-research-daemon)
+[![CI](https://github.com/Booyaka101/gemcatch/actions/workflows/ci.yml/badge.svg)](https://github.com/Booyaka101/gemcatch/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/gemcatch.svg)](https://www.npmjs.com/package/gemcatch)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Fire-and-forget research tasks for the Gemini API. Submit a long-running prompt, get a task ID back in under a second, close your laptop, collect the answer later.
@@ -10,15 +10,15 @@ On [July 7, 2026](https://blog.google/innovation-and-ai/technology/developers-to
 
 > Holding an HTTP connection open for long-running tasks is fragile. Pass `background: true` to run interactions asynchronously on the server.
 
-That solves the server half. The client half is still on you: you get back an interaction ID and now you own it — polling it, remembering which prompt it belonged to, not losing it when your shell dies, noticing that the free tier throws it away after 24 hours. `gemi` is that half. It passes `background: true`, stores the interaction ID in local SQLite next to the prompt that created it, gives you a handful of commands to get results back, and runs a [daemon](#dont-lose-results-gemi-daemon) that collects them before the free tier drops them.
+That solves the server half. The client half is still on you: you get back an interaction ID and now you own it — polling it, remembering which prompt it belonged to, not losing it when your shell dies, noticing that the free tier throws it away after 24 hours. `gemcatch` is that half. It passes `background: true`, stores the interaction ID in local SQLite next to the prompt that created it, gives you a handful of commands to get results back, and runs a [daemon](#dont-lose-results-gemcatch-daemon) that collects them before the free tier drops them.
 
 ```console
-$ gemi research "compare the 2026 EU AI Act timelines against the UK approach"
-Task 8f3a1c04 submitted. Run: gemi get 8f3a1c04 when ready.
+$ gemcatch research "compare the 2026 EU AI Act timelines against the UK approach"
+Task 8f3a1c04 submitted. Run: gemcatch get 8f3a1c04 when ready.
 
 $ # ...close your laptop, come back later...
 
-$ gemi get 8f3a1c04
+$ gemcatch get 8f3a1c04
 The EU AI Act's high-risk obligations phase in from August 2026, whereas...
 ```
 
@@ -44,14 +44,14 @@ To make it permanent, add that line to your shell profile (`$PROFILE` on PowerSh
 ## Run
 
 ```bash
-npx gemi-research-daemon research "your question"
+npx gemcatch research "your question"
 ```
 
 Or install it once and use the short name:
 
 ```bash
-npm install -g gemi-research-daemon
-gemi research "your question"
+npm install -g gemcatch
+gemcatch research "your question"
 ```
 
 From a clone: `npm install && node index.js research "your question"`.
@@ -60,15 +60,15 @@ From a clone: `npm install && node index.js research "your question"`.
 
 ```bash
 # 1. Submit — returns immediately with a task ID
-$ gemi research "summarize this week in AI"
-Task 8f3a1c04 submitted. Run: gemi get 8f3a1c04 when ready.
+$ gemcatch research "summarize this week in AI"
+Task 8f3a1c04 submitted. Run: gemcatch get 8f3a1c04 when ready.
 
-# 2. Check on it — or `gemi list` to see everything
-$ gemi status 8f3a1c04
+# 2. Check on it — or `gemcatch list` to see everything
+$ gemcatch status 8f3a1c04
 Task 8f3a1c04: in_progress
 
 # 3. Collect the answer (blocks and polls until done)
-$ gemi watch 8f3a1c04
+$ gemcatch watch 8f3a1c04
 [10:52:31] 8f3a1c04: in_progress
 [10:54:02] 8f3a1c04: completed
 This week in AI: ...
@@ -78,17 +78,17 @@ This week in AI: ...
 
 | Command | What it does |
 | --- | --- |
-| `gemi research "<prompt>"` | Submits with `background: true`, stores the interaction ID, exits immediately. |
-| `gemi status <id>` | Polls the API and prints the current state. |
-| `gemi get <id>` | Prints the full response if complete, otherwise the current status. |
-| `gemi list` | All tasks, newest first: id, age, status, prompt. |
-| `gemi watch <id>` | Polls until the task finishes, then prints the result. |
-| `gemi sync` | Refreshes every in-flight task in one pass. |
-| `gemi daemon` | Keeps polling in-flight tasks on a loop, so results are cached before they expire. |
-| `gemi cancel <id>` | Asks the API to stop an in-flight task. |
-| `gemi rm <ids...>` | Forgets tasks locally. `--remote` deletes them server-side too. |
-| `gemi prune` | Drops finished tasks older than `--days` (default 30). |
-| `gemi stats` | Where the store lives and what's in it. |
+| `gemcatch research "<prompt>"` | Submits with `background: true`, stores the interaction ID, exits immediately. |
+| `gemcatch status <id>` | Polls the API and prints the current state. |
+| `gemcatch get <id>` | Prints the full response if complete, otherwise the current status. |
+| `gemcatch list` | All tasks, newest first: id, age, status, prompt. |
+| `gemcatch watch <id>` | Polls until the task finishes, then prints the result. |
+| `gemcatch sync` | Refreshes every in-flight task in one pass. |
+| `gemcatch daemon` | Keeps polling in-flight tasks on a loop, so results are cached before they expire. |
+| `gemcatch cancel <id>` | Asks the API to stop an in-flight task. |
+| `gemcatch rm <ids...>` | Forgets tasks locally. `--remote` deletes them server-side too. |
+| `gemcatch prune` | Drops finished tasks older than `--days` (default 30). |
+| `gemcatch stats` | Where the store lives and what's in it. |
 
 Useful flags:
 
@@ -106,7 +106,7 @@ Useful flags:
 | `--dry-run` | `prune` | Show what would go; delete nothing. |
 | `--raw` | `get` | Dump the raw interaction JSON. |
 
-IDs are the first 8 characters of a UUID. Any unique prefix works, so `gemi get 8f3a` is fine.
+IDs are the first 8 characters of a UUID. Any unique prefix works, so `gemcatch get 8f3a` is fine.
 
 Statuses come straight from the API: `in_progress`, `requires_action`, `completed`, `failed`, `cancelled`, `incomplete`, `budget_exceeded`. Plus `pending`, which is local: the row exists but the submit call hasn't returned yet.
 
@@ -114,26 +114,26 @@ Statuses come straight from the API: `in_progress`, `requires_action`, `complete
 
 ```bash
 # Fire off a batch, then collect later
-$ for q in "topic A" "topic B" "topic C"; do gemi research "$q" -t batch1; done
-$ gemi sync                       # one pass now...
-$ gemi daemon --exit-when-idle    # ...or keep polling until they're all in
-$ gemi list --tag batch1 --status completed
+$ for q in "topic A" "topic B" "topic C"; do gemcatch research "$q" -t batch1; done
+$ gemcatch sync                       # one pass now...
+$ gemcatch daemon --exit-when-idle    # ...or keep polling until they're all in
+$ gemcatch list --tag batch1 --status completed
 
 # Long prompt from a file, result to a file.
 # Progress goes to stderr, so the redirect captures only the answer.
-$ gemi research -f brief.md -w > answer.md
+$ gemcatch research -f brief.md -w > answer.md
 
 # Pipe a prompt in
-$ cat notes.txt | gemi research - -s "extract every open question"
+$ cat notes.txt | gemcatch research - -s "extract every open question"
 
 # Script against it
-$ id=$(gemi research "..." --json | jq -r .id)
-$ gemi watch "$id" --json | jq -r .result
+$ id=$(gemcatch research "..." --json | jq -r .id)
+$ gemcatch watch "$id" --json | jq -r .result
 ```
 
 ## How it works
 
-Tasks live in SQLite at `~/.gemi/tasks.db` (override with `GEMI_HOME`):
+Tasks live in SQLite at `~/.gemcatch/tasks.db` (override with `GEMCATCH_HOME`):
 
 ```sql
 CREATE TABLE tasks (id TEXT PRIMARY KEY, prompt TEXT, interaction_id TEXT,
@@ -141,19 +141,19 @@ CREATE TABLE tasks (id TEXT PRIMARY KEY, prompt TEXT, interaction_id TEXT,
 -- plus model, system_instruction, tag, error, usage, updated_at
 ```
 
-`research` calls `interactions.create({model, input, background: true})` via [`@google/genai`](https://www.npmjs.com/package/@google/genai) and keeps the returned `id`. The polling commands call `interactions.get(id)` and write the status back. Once a task completes, the text is cached in the `result` column — `gemi get` then answers from disk without touching the network.
+`research` calls `interactions.create({model, input, background: true})` via [`@google/genai`](https://www.npmjs.com/package/@google/genai) and keeps the returned `id`. The polling commands call `interactions.get(id)` and write the status back. Once a task completes, the text is cached in the `result` column — `gemcatch get` then answers from disk without touching the network.
 
 An older `tasks.db` upgrades in place; migrations are additive and never drop a row.
 
-**Free-tier results expire after 24 hours.** The [docs](https://ai.google.dev/gemini-api/docs/interactions-overview) note the system retains interactions for 1 day on the free tier (55 days paid). Once `gemi` has seen a task complete, the text is cached locally and survives that expiry — but a task nobody polls inside that window is gone server-side. That is what `gemi daemon` is for.
+**Free-tier results expire after 24 hours.** The [docs](https://ai.google.dev/gemini-api/docs/interactions-overview) note the system retains interactions for 1 day on the free tier (55 days paid). Once `gemcatch` has seen a task complete, the text is cached locally and survives that expiry — but a task nobody polls inside that window is gone server-side. That is what `gemcatch daemon` is for.
 
-## Don't lose results: `gemi daemon`
+## Don't lose results: `gemcatch daemon`
 
-Caching a result permanently is easy; *noticing* it is the hard part. If nothing polls a finished task within 24 hours, the answer is dropped server-side and no amount of local bookkeeping brings it back. `gemi daemon` is the something that looks:
+Caching a result permanently is easy; *noticing* it is the hard part. If nothing polls a finished task within 24 hours, the answer is dropped server-side and no amount of local bookkeeping brings it back. `gemcatch daemon` is the something that looks:
 
 ```console
-$ gemi daemon
-gemi daemon: polling every 300s. Store: ~/.gemi/tasks.db. Ctrl-C to stop.
+$ gemcatch daemon
+gemcatch daemon: polling every 300s. Store: ~/.gemcatch/tasks.db. Ctrl-C to stop.
 [10:54:02] 8f3a1c04: completed
 [11:31:20] c7b91e55: completed
 ```
@@ -165,37 +165,37 @@ It refreshes everything in flight on an interval, writes each result to SQLite t
 `--exit-when-idle` stops once nothing is in flight, which makes it the "collect this batch, then quit" one-liner:
 
 ```bash
-$ for q in "topic A" "topic B" "topic C"; do gemi research "$q" -t batch1; done
-$ gemi daemon --exit-when-idle -i 30
-$ gemi list --tag batch1 --status completed
+$ for q in "topic A" "topic B" "topic C"; do gemcatch research "$q" -t batch1; done
+$ gemcatch daemon --exit-when-idle -i 30
+$ gemcatch list --tag batch1 --status completed
 ```
 
 ## Rate limits and retries
 
-The free tier allows roughly 15 requests a minute, which a wide `gemi sync` or a busy daemon would otherwise blow straight through. Every outbound call is paced to `GEMI_RPM` (default 15) — set it higher on a paid key, or `0` to disable pacing entirely.
+The free tier allows roughly 15 requests a minute, which a wide `gemcatch sync` or a busy daemon would otherwise blow straight through. Every outbound call is paced to `GEMCATCH_RPM` (default 15) — set it higher on a paid key, or `0` to disable pacing entirely.
 
-Transient failures are retried with exponential backoff and full jitter, honouring `Retry-After` when the server sends it. A rate limit, a timeout or a 5xx gets `GEMI_MAX_RETRIES` more attempts (default 4); a 4xx does not, because a bad key or a bad model id fails identically forever and retrying it only burns your quota.
+Transient failures are retried with exponential backoff and full jitter, honouring `Retry-After` when the server sends it. A rate limit, a timeout or a 5xx gets `GEMCATCH_MAX_RETRIES` more attempts (default 4); a 4xx does not, because a bad key or a bad model id fails identically forever and retrying it only burns your quota.
 
 ## Environment variables
 
 | Variable | Purpose |
 | --- | --- |
 | `GEMINI_API_KEY` | Your API key. `GOOGLE_API_KEY` also works. |
-| `GEMI_HOME` | Where `tasks.db` lives. Default `~/.gemi`. |
-| `GEMI_MODEL` | Default model. Default `gemini-3.1-flash-lite`. |
-| `GEMI_POLL_MS` | `watch` poll interval in ms. Default `10000`. |
-| `GEMI_DAEMON_S` | `daemon` interval in seconds. Default `300`. |
-| `GEMI_RPM` | Requests/minute ceiling. Default `15` (the free tier). `0` disables pacing. |
-| `GEMI_MAX_RETRIES` | Extra attempts on a transient failure. Default `4`. `0` disables retries. |
-| `GEMI_BASE_URL` | Override the API endpoint (proxy/gateway/testing). |
-| `GEMI_FORCE_REST` | `1` bypasses the SDK and uses raw `fetch`. |
+| `GEMCATCH_HOME` | Where `tasks.db` lives. Default `~/.gemcatch`. |
+| `GEMCATCH_MODEL` | Default model. Default `gemini-3.1-flash-lite`. |
+| `GEMCATCH_POLL_MS` | `watch` poll interval in ms. Default `10000`. |
+| `GEMCATCH_DAEMON_S` | `daemon` interval in seconds. Default `300`. |
+| `GEMCATCH_RPM` | Requests/minute ceiling. Default `15` (the free tier). `0` disables pacing. |
+| `GEMCATCH_MAX_RETRIES` | Extra attempts on a transient failure. Default `4`. `0` disables retries. |
+| `GEMCATCH_BASE_URL` | Override the API endpoint (proxy/gateway/testing). |
+| `GEMCATCH_FORCE_REST` | `1` bypasses the SDK and uses raw `fetch`. |
 | `NO_COLOR` | Disable colour output. |
 
 ## Development
 
 ```bash
-git clone https://github.com/Booyaka101/gemi-research-daemon
-cd gemi-research-daemon
+git clone https://github.com/Booyaka101/gemcatch
+cd gemcatch
 npm install
 npm test
 ```

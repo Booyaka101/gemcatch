@@ -7,8 +7,8 @@ const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const { PENDING, TERMINAL } = require('./status');
 
-// GEMI_HOME lets tests and power users relocate the store.
-const HOME = process.env.GEMI_HOME || path.join(os.homedir(), '.gemi');
+// GEMCATCH_HOME lets tests and power users relocate the store.
+const HOME = process.env.GEMCATCH_HOME || path.join(os.homedir(), '.gemcatch');
 const DB_PATH = path.join(HOME, 'tasks.db');
 
 // The v1 shape. Never change this -- migrations below carry it forward, so an

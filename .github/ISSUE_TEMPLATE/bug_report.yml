@@ -14,7 +14,7 @@ body:
       label: What happened
       description: What you ran, and what came back.
       placeholder: |
-        $ gemi get 8f3a1c04
+        $ gemcatch get 8f3a1c04
         Error: ...
     validations:
       required: true
@@ -29,8 +29,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: gemi version
-      description: Output of `gemi --version`
+      label: gemcatch version
+      description: Output of `gemcatch --version`
     validations:
       required: true
 
@@ -46,6 +46,6 @@ body:
   - type: textarea
     id: stats
     attributes:
-      label: gemi stats
+      label: gemcatch stats
       description: Optional, but it tells us where your store is and what's in it.
       render: shell

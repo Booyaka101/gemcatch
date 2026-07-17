@@ -46,10 +46,10 @@ jobs:
       # release does.
       - run: npm pack --dry-run
 
-      - name: gemi runs from a packed tarball
+      - name: gemcatch runs from a packed tarball
         run: |
           npm pack
-          npm install -g ./gemi-research-daemon-*.tgz
-          gemi --version
-          gemi --help
-          gemi list
+          npm install -g ./gemcatch-*.tgz
+          gemcatch --version
+          gemcatch --help
+          gemcatch list

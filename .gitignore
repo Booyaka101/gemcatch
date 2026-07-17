@@ -10,8 +10,8 @@ Thumbs.db
 coverage/
 .env
 .env.*
-# Local task store, if anyone points GEMI_HOME at the repo.
-.gemi/
+# Local task store, if anyone points GEMCATCH_HOME at the repo.
+.gemcatch/
 tasks.db
 tasks.db-wal
 tasks.db-shm

@@ -1,10 +1,10 @@
 {
-  "name": "gemi-research-daemon",
+  "name": "gemcatch",
   "version": "0.1.0",
   "description": "Fire-and-forget CLI for Gemini's Interactions API background execution. Submit long-running research prompts, close your laptop, collect results later.",
   "main": "index.js",
   "bin": {
-    "gemi": "index.js"
+    "gemcatch": "index.js"
   },
   "files": [
     "index.js",
@@ -38,12 +38,12 @@
   "author": "Booyaka101",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Booyaka101/gemi-research-daemon.git"
+    "url": "git+https://github.com/Booyaka101/gemcatch.git"
   },
   "bugs": {
-    "url": "https://github.com/Booyaka101/gemi-research-daemon/issues"
+    "url": "https://github.com/Booyaka101/gemcatch/issues"
   },
-  "homepage": "https://github.com/Booyaka101/gemi-research-daemon#readme",
+  "homepage": "https://github.com/Booyaka101/gemcatch#readme",
   "dependencies": {
     "@google/genai": "^2.12.0",
     "better-sqlite3": "^12.11.1",

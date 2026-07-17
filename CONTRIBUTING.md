@@ -5,8 +5,8 @@ Thanks for considering it. This is a small tool with a deliberately small surfac
 ## Getting set up
 
 ```bash
-git clone https://github.com/Booyaka101/gemi-research-daemon
-cd gemi-research-daemon
+git clone https://github.com/Booyaka101/gemcatch
+cd gemcatch
 npm install
 npm test
 ```
@@ -20,10 +20,10 @@ export GEMINI_API_KEY=...
 node index.js research "does this thing work"
 ```
 
-Point `GEMI_HOME` somewhere disposable while hacking so you don't pollute your real `~/.gemi`:
+Point `GEMCATCH_HOME` somewhere disposable while hacking so you don't pollute your real `~/.gemcatch`:
 
 ```bash
-export GEMI_HOME=/tmp/gemi-dev
+export GEMCATCH_HOME=/tmp/gemcatch-dev
 ```
 
 ## Layout
@@ -46,7 +46,7 @@ These are all load-bearing and were each learned the hard way:
 - **The SDK's error `.message` is a useless stub** (`400 API error occurred: {"httpMeta":{...}}`). The real payload is on `.body` as a JSON string. `friendly()` unwraps it.
 - **Both transports funnel through `apiError()`** so guidance can't drift between them.
 - **Every call goes through `call()`**, which paces it (`gate()`) and retries it. Add a new API operation and it must too, or it silently escapes both.
-- **Concurrency is not a rate.** `mapLimit` in `index.js` bounds how many polls are open at once; `GEMI_RPM` in `gemini.js` is what actually keeps a wide fan-out inside the free tier's requests-per-minute allowance. They are different limits and both matter.
+- **Concurrency is not a rate.** `mapLimit` in `index.js` bounds how many polls are open at once; `GEMCATCH_RPM` in `gemini.js` is what actually keeps a wide fan-out inside the free tier's requests-per-minute allowance. They are different limits and both matter.
 - **Only transient failures retry.** 408/429/5xx and network errors, never 4xx: a bad key or bad model id fails the same way forever, so retrying it just spends the user's quota to reach the identical error. `shouldRetry()` is the one place that decides, and it's pinned by a test.
 
 ## Tests
@@ -71,4 +71,4 @@ Two rules that keep it honest:
 
 ## Reporting bugs
 
-Open an issue with what you ran, what happened, and what you expected. `gemi stats` and your Node version help. **Never paste your API key** — including in log output.
+Open an issue with what you ran, what happened, and what you expected. `gemcatch stats` and your Node version help. **Never paste your API key** — including in log output.

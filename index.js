@@ -7,11 +7,11 @@ const store = require('./db');
 const gemini = require('./gemini');
 const { TERMINAL, ACTIVE, PENDING, isDone, isSuccess } = require('./status');
 
-const DEFAULT_POLL_MS = Number(process.env.GEMI_POLL_MS) || 10000;
+const DEFAULT_POLL_MS = Number(process.env.GEMCATCH_POLL_MS) || 10000;
 // Free-tier results are dropped after 24h, so the daemon only has to be
 // comfortably faster than that. Five minutes is far inside the margin and
 // costs a handful of requests an hour.
-const DEFAULT_DAEMON_S = Number(process.env.GEMI_DAEMON_S) || 300;
+const DEFAULT_DAEMON_S = Number(process.env.GEMCATCH_DAEMON_S) || 300;
 const ALL_STATUSES = [PENDING].concat(ACTIVE, TERMINAL);
 
 // --- output ---------------------------------------------------------------
@@ -55,7 +55,7 @@ function needTask(id) {
     die(err); // ambiguous prefix
   }
   if (!task) {
-    console.error(`Error: no task matching '${id}'. Try: gemi list`);
+    console.error(`Error: no task matching '${id}'. Try: gemcatch list`);
     process.exit(1);
   }
   return task;
@@ -105,7 +105,7 @@ async function refresh(task) {
 }
 
 // Bounds how many polls are open at once. The *rate* limit is enforced in
-// gemini.js (GEMI_RPM), which is the part that keeps a wide fan-out inside the
+// gemini.js (GEMCATCH_RPM), which is the part that keeps a wide fan-out inside the
 // free tier's requests-per-minute allowance.
 async function mapLimit(items, limit, fn) {
   const out = [];
@@ -123,7 +123,7 @@ async function mapLimit(items, limit, fn) {
 
 const program = new Command();
 program
-  .name('gemi')
+  .name('gemcatch')
   .description("Fire-and-forget research tasks on Gemini's Interactions API (background execution).")
   .version(require('./package.json').version);
 
@@ -135,7 +135,7 @@ program
   .option('-f, --file <path>', 'read the prompt from a file')
   .option('-m, --model <id>', 'model to use', gemini.DEFAULT_MODEL)
   .option('-s, --system <text>', 'system instruction')
-  .option('-t, --tag <tag>', 'label for filtering with `gemi list --tag`')
+  .option('-t, --tag <tag>', 'label for filtering with `gemcatch list --tag`')
   .option('-w, --watch', 'wait for the result instead of exiting')
   .option('--json', 'machine-readable output')
   .description('submit a background task and exit immediately')
@@ -153,14 +153,14 @@ program
       store.setInteraction(id, r.interactionId, r.status);
       if (opts.watch) {
         // Under --watch the submit line is progress, not the answer, so it
-        // goes to stderr -- `gemi research -w "..." > out.txt` then captures
+        // goes to stderr -- `gemcatch research -w "..." > out.txt` then captures
         // only the result.
         if (!opts.json) console.error(dim(`Task ${id} submitted.`));
         await watchTask(store.getTask(id), DEFAULT_POLL_MS, opts.json);
         return;
       }
       emit(opts.json, { id, interaction_id: r.interactionId, status: r.status }, () =>
-        console.log(`Task ${id} submitted. Run: gemi get ${id} when ready.`)
+        console.log(`Task ${id} submitted. Run: gemcatch get ${id} when ready.`)
       );
     } catch (err) {
       if (id) store.setStatus(id, 'failed', { error: err.message });
@@ -219,7 +219,7 @@ program
         process.exitCode = 1;
       } else {
         emit(opts.json, { id: task.id, status: r.status, result: null }, () =>
-          console.log(`Task ${task.id}: ${colorStatus(r.status)} — not ready yet. Try: gemi watch ${task.id}`)
+          console.log(`Task ${task.id}: ${colorStatus(r.status)} — not ready yet. Try: gemcatch watch ${task.id}`)
         );
       }
     } catch (err) {
@@ -241,7 +241,7 @@ program
     const tasks = store.listTasks({ status: opts.status, tag: opts.tag, limit: opts.limit });
     if (opts.json) return console.log(JSON.stringify(tasks, null, 2));
     if (!tasks.length) {
-      console.log('No tasks yet. Submit one:  gemi research "your question"');
+      console.log('No tasks yet. Submit one:  gemcatch research "your question"');
       return;
     }
     console.log(dim('ID        AGE   STATUS           PROMPT'));
@@ -319,7 +319,7 @@ program
 
     if (!opts.json) {
       console.error(
-        dim(`gemi daemon: polling every ${intervalMs / 1000}s. Store: ${store.DB_PATH}. Ctrl-C to stop.`)
+        dim(`gemcatch daemon: polling every ${intervalMs / 1000}s. Store: ${store.DB_PATH}. Ctrl-C to stop.`)
       );
     }
     event({ event: 'start', interval_s: intervalMs / 1000, db: store.DB_PATH });
@@ -367,7 +367,7 @@ program
     }
 
     event({ event: 'stop' });
-    if (!opts.json) console.error(dim('gemi daemon: stopped.'));
+    if (!opts.json) console.error(dim('gemcatch daemon: stopped.'));
     store.close();
   });
 
@@ -377,7 +377,7 @@ async function watchTask(task, intervalMs, json) {
   let last = null;
   for (;;) {
     const r = await refresh(task);
-    // Status chatter goes to stderr so `gemi watch x > out.txt` captures only
+    // Status chatter goes to stderr so `gemcatch watch x > out.txt` captures only
     // the result.
     if (r.status !== last && !json) {
       console.error(dim(`[${new Date().toISOString().slice(11, 19)}] ${task.id}: `) + colorStatus(r.status));

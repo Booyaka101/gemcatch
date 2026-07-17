@@ -5,7 +5,7 @@
  *
  * Covers what a live key would otherwise be needed for: the success path
  * (in_progress -> completed -> text), cancellation, deletion and sync.
- * Runs against the raw-fetch fallback via GEMI_FORCE_REST=1, which also
+ * Runs against the raw-fetch fallback via GEMCATCH_FORCE_REST=1, which also
  * exercises step-based text extraction -- REST responses carry no
  * output_text (the SDK synthesises that field).
  *
@@ -21,7 +21,7 @@ const { spawn } = require('child_process');
 const Database = require('better-sqlite3');
 
 const ANSWER = 'This week in AI: the Interactions API shipped background execution.';
-const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'gemi-test-'));
+const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'gemcatch-test-'));
 
 let seq = 0;
 let getHits = 0;
@@ -125,14 +125,14 @@ function testEnv(extra) {
     {},
     process.env,
     {
-      GEMI_HOME: HOME,
-      GEMI_FORCE_REST: '1',
-      GEMI_BASE_URL: `http://127.0.0.1:${server.address().port}/interactions`,
+      GEMCATCH_HOME: HOME,
+      GEMCATCH_FORCE_REST: '1',
+      GEMCATCH_BASE_URL: `http://127.0.0.1:${server.address().port}/interactions`,
       GEMINI_API_KEY: 'TEST_KEY',
-      GEMI_POLL_MS: '30',
+      GEMCATCH_POLL_MS: '30',
       // The real default (15/min) would pace this suite to a crawl. The
       // limiter has its own test below, which switches it back on.
-      GEMI_RPM: '0',
+      GEMCATCH_RPM: '0',
       NO_COLOR: '1',
     },
     extra || {}
@@ -215,7 +215,7 @@ async function submit(prompt, args, extra) {
   );
   legacyDb.prepare('INSERT INTO tasks (id, prompt, status, created_at) VALUES (?,?,?,?)').run('old00001', 'legacy row', 'completed', 1);
   legacyDb.close();
-  const migrated = (await out(['list'], { env: { GEMI_HOME: legacy } }));
+  const migrated = (await out(['list'], { env: { GEMCATCH_HOME: legacy } }));
   assert(migrated.includes('old00001'), `legacy row should survive migration: ${migrated}`);
   const cols = new Database(path.join(legacy, 'tasks.db')).prepare('PRAGMA table_info(tasks)').all().map((c) => c.name);
   for (const c of ['model', 'tag', 'usage', 'updated_at', 'error', 'system_instruction']) {
@@ -229,7 +229,7 @@ async function submit(prompt, args, extra) {
   const elapsed = Date.now() - t0;
   const id = idOf(first);
   assert(id, `expected submit line, got: ${first}`);
-  assert(first.includes(`Run: gemi get ${id} when ready.`), 'exact brief wording');
+  assert(first.includes(`Run: gemcatch get ${id} when ready.`), 'exact brief wording');
   assert(elapsed < 3000, `research must exit <3s, took ${elapsed}ms`);
   ok(`research submitted ${id} in ${elapsed}ms and exited`);
 
@@ -302,7 +302,7 @@ async function submit(prompt, args, extra) {
   ok('watch polls until complete then prints the result');
 
   // ---- research --watch ----
-  // The README promises `gemi research -w "..." > out.txt` captures only the
+  // The README promises `gemcatch research -w "..." > out.txt` captures only the
   // answer, so stdout must carry the result and nothing else.
   const rw = await cli(['research', 'SLOW watch inline', '-w']);
   assert.strictEqual(rw.stdout.trim(), ANSWER, `stdout must be answer-only: ${JSON.stringify(rw.stdout)}`);
@@ -327,17 +327,17 @@ async function submit(prompt, args, extra) {
   // `sync` cannot finish faster than ~2s. That gap is what proves the pacing
   // is real rather than the fan-out merely being slow.
   const rlHome = path.join(HOME, 'ratelimit');
-  const rlEnv = { GEMI_HOME: rlHome };
+  const rlEnv = { GEMCATCH_HOME: rlHome };
   for (const p of ['SLOW rl one', 'SLOW rl two', 'SLOW rl three']) await submit(p, [], { env: rlEnv });
   const rlStart = Date.now();
-  await out(['sync'], { env: Object.assign({}, rlEnv, { GEMI_RPM: '60' }) });
+  await out(['sync'], { env: Object.assign({}, rlEnv, { GEMCATCH_RPM: '60' }) });
   const rlTook = Date.now() - rlStart;
   assert(rlTook >= 1800, `3 polls at 60/min should take ~2s, took ${rlTook}ms`);
-  ok(`GEMI_RPM paces a wide sync (3 polls at 60/min took ${rlTook}ms)`);
+  ok(`GEMCATCH_RPM paces a wide sync (3 polls at 60/min took ${rlTook}ms)`);
 
   // ---- daemon ----
   const dHome = path.join(HOME, 'daemon');
-  const dEnv = { GEMI_HOME: dHome };
+  const dEnv = { GEMCATCH_HOME: dHome };
   const d1 = await submit('SLOW daemon one', [], { env: dEnv });
   const d2 = await submit('SLOW daemon two', [], { env: dEnv });
   const dRun = await cli(['daemon', '-i', '0.05', '--exit-when-idle', '--json'], { env: dEnv });
@@ -366,7 +366,7 @@ async function submit(prompt, args, extra) {
   // still leaves every result it had already collected on disk. This is what
   // makes the daemon safe to run unattended, so it is worth pinning.
   const kHome = path.join(HOME, 'daemon-kill');
-  const kEnv = { GEMI_HOME: kHome };
+  const kEnv = { GEMCATCH_HOME: kHome };
   const k1 = await submit('SLOW killed daemon', [], { env: kEnv });
   const killed = spawn(process.execPath, [path.join(__dirname, 'index.js'), 'daemon', '-i', '0.05'], {
     env: testEnv(kEnv),
@@ -442,7 +442,7 @@ async function submit(prompt, args, extra) {
 
   // ---- unknown id ----
   await assert.rejects(() => cli(['get', 'nope1234']), /no task matching/, 'unknown id');
-  ok('unknown id fails with a pointer to `gemi list`');
+  ok('unknown id fails with a pointer to `gemcatch list`');
 
   // ---- bad key ----
   const keyErr = await cli(['research', 'nope'], { env: { GEMINI_API_KEY: 'WRONG' } }).catch((e) => e);

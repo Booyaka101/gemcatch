@@ -60,7 +60,7 @@ representative at an online or offline event.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported privately to the community leaders responsible for enforcement, using
-GitHub's [private reporting form](https://github.com/Booyaka101/gemi-research-daemon/security/advisories/new).
+GitHub's [private reporting form](https://github.com/Booyaka101/gemcatch/security/advisories/new).
 It is the same private channel used for security reports, and it is not visible
 to anyone else. Please don't open a public issue for a conduct problem.
 

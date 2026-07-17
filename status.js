@@ -16,7 +16,7 @@ const PENDING = 'pending';
 // Reached a final state. Polling one of these again tells you nothing new.
 const TERMINAL = Object.freeze(['completed', 'failed', 'cancelled', 'incomplete', 'budget_exceeded']);
 
-// Still moving. `gemi sync` refreshes exactly these.
+// Still moving. `gemcatch sync` refreshes exactly these.
 const ACTIVE = Object.freeze(['in_progress', 'requires_action']);
 
 const TERMINAL_SET = new Set(TERMINAL);
