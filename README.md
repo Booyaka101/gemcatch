@@ -24,7 +24,7 @@ The EU AI Act's high-risk obligations phase in from August 2026, whereas...
 
 ## Setup
 
-Needs Node.js 20+ and a Gemini API key. **Getting a key needs no billing account and no card.** `gemini-3.1-flash-lite` runs free within the [free tier's](https://ai.google.dev/gemini-api/docs/pricing) daily quota; past that, paid rates apply.
+Needs Node.js 22+ and a Gemini API key. **Getting a key needs no billing account and no card.** `gemini-3.1-flash-lite` runs free within the [free tier's](https://ai.google.dev/gemini-api/docs/pricing) daily quota; past that, paid rates apply.
 
 1. Get a key at **<https://aistudio.google.com/apikey>**
 2. Put it in your environment:

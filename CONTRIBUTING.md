@@ -11,7 +11,7 @@ npm install
 npm test
 ```
 
-You need Node.js 20+. **You do not need an API key to develop or run the tests** — the suite runs the real CLI against a mock Interactions API on localhost, so it costs nothing and works offline.
+You need Node.js 22+. **You do not need an API key to develop or run the tests** — the suite runs the real CLI against a mock Interactions API on localhost, so it costs nothing and works offline.
 
 To try it for real, get a free key at <https://aistudio.google.com/apikey> (no billing account required) and:
 

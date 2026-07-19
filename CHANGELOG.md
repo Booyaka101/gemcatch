@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-19
+
+### Fixed
+
+- REST fallback (`GEMCATCH_FORCE_REST=1`, or when the SDK lacks Interactions)
+  no longer prepends the echoed prompt and the model's reasoning to the result.
+  A real Interactions response tags each step by type; only `model_output` is
+  the answer. The default SDK path was unaffected. Verified live against the API.
+
+### Changed
+
+- Require Node.js 22+. The advertised "20+" was never accurate — `commander@15`
+  requires Node `>=22.12`, and Node 20 reached end-of-life. CI now covers 22 and 24.
+- Clarified the free-tier wording in the README: `gemini-3.1-flash-lite` is free
+  within the free tier's daily quota, then billed at standard rates.
+
 ## [0.1.0] - 2026-07-17
 
 First release. Wraps the background execution capability added to the Gemini
