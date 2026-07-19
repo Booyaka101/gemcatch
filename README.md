@@ -83,6 +83,8 @@ This week in AI: ...
 | `gemcatch status <id>` | Polls the API and prints the current state. |
 | `gemcatch get <id>` | Prints the full response if complete, otherwise the current status. |
 | `gemcatch list` | All tasks, newest first: id, age, status, prompt. |
+| `gemcatch export` | Concatenates finished results, each under its prompt, to stdout or a file (Markdown or JSON). |
+| `gemcatch digest` | Feeds a tag's completed results through one Gemini call into a single summary. |
 | `gemcatch watch <id>` | Polls until the task finishes, then prints the result. |
 | `gemcatch sync` | Refreshes every in-flight task in one pass. |
 | `gemcatch daemon` | Keeps polling in-flight tasks on a loop, so results are cached before they expire. |
@@ -102,9 +104,12 @@ Useful flags:
 | `-t, --tag <tag>` | `research`, `batch`, `list` | Label tasks and filter them. |
 | `-w, --watch` | `research`, `batch` | Submit and wait, in one command. |
 | `--separator <str>` | `batch` | Split the file on this delimiter line for multi-line prompts. |
-| `-i, --interval <s>` | `watch`, `daemon` | Poll rate. Default 10s for `watch`, 300s for `daemon`. |
+| `-i, --interval <s>` | `watch`, `daemon` | Poll rate in seconds; must be > 0. Default 10s for `watch`, 300s for `daemon`. |
 | `--exit-when-idle` | `daemon` | Stop once nothing is left in flight. |
-| `-n, --limit <n>` | `list` | Cap the rows. |
+| `--status <s>` | `list`, `export` | Only tasks in this status. |
+| `-n, --limit <n>` | `list` | Cap the rows (non-negative; `0` shows none). |
+| `--format <md\|json>` | `export` | Output format. Default `md`. |
+| `-o, --out <file>` | `export` | Write to a file instead of stdout. |
 | `--dry-run` | `batch`, `prune` | Show what would go; submit/delete nothing. |
 | `--raw` | `get` | Dump the raw interaction JSON. |
 
@@ -117,9 +122,14 @@ Statuses come straight from the API: `in_progress`, `requires_action`, `complete
 ```bash
 # Fire off a whole file of prompts in one command, then collect later.
 # Every task shares one auto-generated tag (batch-xxxxxx), printed on submit.
-$ gemcatch batch questions.txt        # one prompt per line; # and blanks skipped
+$ gemcatch batch questions.txt        # one prompt per line; "# " and blanks skipped
 $ gemcatch daemon --exit-when-idle    # keep polling until they're all in
 $ gemcatch list --tag batch-1a2b3c --status completed
+
+# Collect a whole batch into one document (the "gather" for batch's "scatter").
+$ gemcatch export --tag batch-1a2b3c -o results.md   # Markdown, one section per prompt
+$ gemcatch export --tag batch-1a2b3c --format json | jq -r '.[].result'
+$ gemcatch digest --tag batch-1a2b3c                 # or synthesize them into one summary
 
 # Multi-line prompts: split the file on a delimiter line instead of per-line
 $ gemcatch batch briefs.md --separator ---
@@ -182,9 +192,13 @@ $ gemcatch daemon --exit-when-idle -i 30
 $ gemcatch list --tag batch1 --status completed
 ```
 
+If a task's interaction has vanished server-side — the free tier dropped it after 24h, or it was deleted — polling it returns a 404. Rather than chase a task that can never resolve, `gemcatch` retires it locally to `incomplete`, so it leaves the in-flight set and `--exit-when-idle` still converges. `watch` and `batch -w` also give up after a bounded run of consecutive poll failures (`GEMCATCH_WATCH_MAX_FAILS`, default 10) instead of looping forever.
+
 ## Rate limits and retries
 
 The free tier allows roughly 15 requests a minute, which a wide `gemcatch sync` or a busy daemon would otherwise blow straight through. Every outbound call is paced to `GEMCATCH_RPM` (default 15) — set it higher on a paid key, or `0` to disable pacing entirely.
+
+Pacing is **per process**: each `gemcatch` invocation keeps its own counter, so two running at once (a `daemon` in one terminal and a one-off `sync` in another) can together exceed the ceiling. If you need the limit to hold, run a single daemon and let it do the polling.
 
 Transient failures are retried with exponential backoff and full jitter, honouring `Retry-After` when the server sends it. A rate limit, a timeout or a 5xx gets `GEMCATCH_MAX_RETRIES` more attempts (default 4); a 4xx does not, because a bad key or a bad model id fails identically forever and retrying it only burns your quota.
 
@@ -199,6 +213,7 @@ Transient failures are retried with exponential backoff and full jitter, honouri
 | `GEMCATCH_DAEMON_S` | `daemon` interval in seconds. Default `300`. |
 | `GEMCATCH_RPM` | Requests/minute ceiling. Default `15` (the free tier). `0` disables pacing. |
 | `GEMCATCH_MAX_RETRIES` | Extra attempts on a transient failure. Default `4`. `0` disables retries. |
+| `GEMCATCH_WATCH_MAX_FAILS` | Consecutive poll failures before `watch`/`batch -w` give up. Default `10`. |
 | `GEMCATCH_BASE_URL` | Override the API endpoint (proxy/gateway/testing). |
 | `GEMCATCH_FORCE_REST` | `1` bypasses the SDK and uses raw `fetch`. |
 | `NO_COLOR` | Disable colour output. |

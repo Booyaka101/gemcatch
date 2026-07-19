@@ -56,14 +56,18 @@ const server = http.createServer((req, res) => {
       interactions.set(id, {
         status: 'in_progress',
         prompt: body.input,
-        // SLOW stays in_progress for a couple of polls; FAIL and FLAKY resolve
-        // on the first successful one so both paths are reachable in a single
-        // `get`.
-        pollsLeft: /SLOW/.test(body.input) ? 2 : /FAIL|FLAKY/.test(body.input) ? 0 : 1,
-        text: /FAIL/.test(body.input) ? '' : ANSWER,
+        // SLOW stays in_progress for a couple of polls; FAIL/FLAKY/EMPTY and the
+        // wedge cases resolve on the first successful one so both paths are
+        // reachable in a single `get`.
+        pollsLeft: /SLOW/.test(body.input) ? 2 : /FAIL|FLAKY|EMPTY|WATCHWEDGE|HARDFAIL/.test(body.input) ? 0 : 1,
+        // FAIL and EMPTY both complete with no text; only FAIL is an error.
+        text: /FAIL|EMPTY/.test(body.input) ? '' : ANSWER,
         fails: /FAIL/.test(body.input),
         // FLAKY answers the first two polls with a 503 before behaving.
         flakyLeft: /FLAKY/.test(body.input) ? 2 : 0,
+        // WATCHWEDGE 500s a few times then recovers; HARDFAIL 500s forever. Both
+        // drive the watch/daemon consecutive-failure safety bound.
+        hardFailLeft: /HARDFAIL/.test(body.input) ? Infinity : /WATCHWEDGE/.test(body.input) ? 4 : 0,
         model: body.model,
         system: body.system_instruction,
       });
@@ -92,6 +96,13 @@ const server = http.createServer((req, res) => {
     getHits += 1;
     const it = interactions.get(idPart);
     if (!it) return send(404, { error: { code: 404, message: 'Interaction not found.' } });
+    // WATCHWEDGE/HARDFAIL: a 500 that, with retries off, surfaces straight to
+    // the watch loop and drives its consecutive-failure bound. Infinity never
+    // recovers; a finite count recovers once it hits zero.
+    if (it.hardFailLeft > 0) {
+      it.hardFailLeft -= 1;
+      return send(500, { error: { code: 500, message: 'Internal error. Please try again.' } });
+    }
     // Retry-After: 0 keeps the suite fast while still exercising the header.
     if (it.flakyLeft > 0) {
       it.flakyLeft -= 1;
@@ -164,6 +175,34 @@ function cli(args, extra) {
       const e = new Error(`exit ${code}: ${stderr.trim()}`);
       Object.assign(e, r);
       reject(e);
+    });
+    child.stdin.end(o.stdin === undefined ? '' : o.stdin);
+  });
+}
+
+// Like cli(), but never hangs the suite: if the process doesn't exit within
+// `ms` it is killed and the result carries `timedOut: true` for the caller to
+// assert on. Used to prove the watch/daemon safety bounds actually fire.
+function cliTimeout(args, extra, ms) {
+  const o = extra || {};
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(__dirname, 'index.js')].concat(args), {
+      env: testEnv(o.env),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, ms);
+    child.stdout.on('data', (d) => (stdout += d));
+    child.stderr.on('data', (d) => (stderr += d));
+    child.on('error', reject);
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ stdout, stderr, code, timedOut });
     });
     child.stdin.end(o.stdin === undefined ? '' : o.stdin);
   });
@@ -540,6 +579,217 @@ async function submit(prompt, args, extra) {
   const noKey = await cli(['research', 'nope'], { env: { GEMINI_API_KEY: '', GOOGLE_API_KEY: '' } }).catch((e) => e);
   assert(/GEMINI_API_KEY is not set/.test(noKey.stderr), `expected no-key message: ${noKey.stderr}`);
   ok('a missing key explains how to get one');
+
+  // ========================================================================
+  // Audit fixes (0.3.0)
+  // ========================================================================
+
+  // ---- #1: a poll error mid research --watch never marks a submitted task
+  // failed; it stays active and a later poll still completes it. ----
+  const wwEnv = { GEMCATCH_HOME: path.join(HOME, 'watchwedge') };
+  const ww = await cliTimeout(
+    ['research', 'WATCHWEDGE research me', '-w'],
+    { env: Object.assign({}, wwEnv, { GEMCATCH_MAX_RETRIES: '0', GEMCATCH_WATCH_MAX_FAILS: '2' }) },
+    15000
+  );
+  assert.strictEqual(ww.timedOut, false, 'the watch must give up, not hang, on a wedged poll');
+  assert.strictEqual(ww.code, 1, 'giving up on a watch exits non-zero');
+  assert(/[Gg]ave up watching/.test(ww.stderr), `expected a give-up message: ${ww.stderr}`);
+  const wwRow = new Database(path.join(wwEnv.GEMCATCH_HOME, 'tasks.db')).prepare('SELECT id, status FROM tasks').get();
+  assert.notStrictEqual(wwRow.status, 'failed', 'a watch poll error must never mark the submitted task failed');
+  assert.strictEqual(wwRow.status, 'in_progress', `the task stays active for the daemon: ${wwRow.status}`);
+  // Full retries (a later get / the daemon) recover it once the blips clear.
+  assert.strictEqual((await out(['get', wwRow.id], { env: wwEnv })).trim(), ANSWER, 'a later get still collects the result');
+  ok('#1 a poll error during research --watch leaves the task active (not failed); a later get completes it');
+
+  // ---- #2: a 404 on poll retires the task to incomplete, so
+  // `daemon --exit-when-idle` converges instead of spinning forever. ----
+  const exEnv = { GEMCATCH_HOME: path.join(HOME, 'expire404') };
+  const exId = await submit('SLOW expire me', [], { env: exEnv });
+  const exIid = new Database(path.join(exEnv.GEMCATCH_HOME, 'tasks.db'))
+    .prepare('SELECT interaction_id FROM tasks WHERE id = ?')
+    .get(exId).interaction_id;
+  interactions.delete(exIid); // the free tier drops it; every poll now 404s
+  const exDaemon = await cliTimeout(['daemon', '-i', '0.05', '--exit-when-idle', '--json'], { env: exEnv }, 15000);
+  assert.strictEqual(exDaemon.timedOut, false, 'daemon --exit-when-idle must converge once the 404 retires the task');
+  const exRow = new Database(path.join(exEnv.GEMCATCH_HOME, 'tasks.db'))
+    .prepare('SELECT status, error FROM tasks WHERE id = ?')
+    .get(exId);
+  assert.strictEqual(exRow.status, 'incomplete', `a 404 poll should retire the task to incomplete: ${JSON.stringify(exRow)}`);
+  assert(/not found/.test(exRow.error || ''), 'the retire reason should be recorded');
+  ok('#2 a 404 poll retires the task to incomplete and daemon --exit-when-idle converges');
+
+  // ---- #2 (bound): a permanently-failing poll hits the safety bound instead
+  // of looping forever. ----
+  const hfEnv = { GEMCATCH_HOME: path.join(HOME, 'hardfail') };
+  const hfId = await submit('HARDFAIL forever', [], { env: hfEnv });
+  const hf = await cliTimeout(
+    ['watch', hfId],
+    { env: Object.assign({}, hfEnv, { GEMCATCH_MAX_RETRIES: '0', GEMCATCH_WATCH_MAX_FAILS: '3', GEMCATCH_POLL_MS: '20' }) },
+    15000
+  );
+  assert.strictEqual(hf.timedOut, false, 'a persistently failing watch must stop at the bound, not loop forever');
+  assert.strictEqual(hf.code, 1, 'hitting the safety bound exits non-zero');
+  assert(/consecutive poll failures/.test(hf.stderr), `expected the bound message: ${hf.stderr}`);
+  ok('#2 a permanently-failing watch stops at the consecutive-failure bound');
+
+  // ---- #4: prune -d <negative> is rejected and deletes nothing. ----
+  const p4Env = { GEMCATCH_HOME: path.join(HOME, 'prune-neg') };
+  const p4 = await submit('prune neg victim', [], { env: p4Env });
+  await cliTimeout(['watch', p4, '-i', '0.02'], { env: p4Env }, 15000); // drive to completed
+  const p4db = new Database(path.join(p4Env.GEMCATCH_HOME, 'tasks.db'));
+  p4db.prepare('UPDATE tasks SET created_at = ? WHERE id = ?').run(Date.now() - 999 * 86400000, p4);
+  p4db.close();
+  const p4rej = await cli(['prune', '-d', '-5'], { env: p4Env }).catch((e) => e);
+  assert.strictEqual(p4rej.code, 1, 'prune -d -5 should be rejected');
+  assert(/--days must be a non-negative number/.test(p4rej.stderr), `expected a clear rejection: ${p4rej.stderr}`);
+  assert((await out(['list'], { env: p4Env })).includes(p4), 'a rejected prune must delete nothing, even an ancient finished task');
+  ok('#4 prune -d <negative> is rejected and deletes nothing');
+
+  // ---- #5: a completed-but-empty result is served from cache, not re-polled. ----
+  const emEnv = { GEMCATCH_HOME: path.join(HOME, 'empty') };
+  const emId = await submit('EMPTY result please', [], { env: emEnv });
+  const em1 = await cliTimeout(['watch', emId, '-i', '0.02'], { env: emEnv }, 15000);
+  assert.strictEqual(em1.code, 0, `an empty completion is still a success: ${em1.stderr}`);
+  const beforeEmpty = getHits;
+  const em2 = await cli(['get', emId], { env: emEnv });
+  assert.strictEqual(getHits, beforeEmpty, 'an empty completed result must come from SQLite, not the API');
+  assert(/empty response/.test(em2.stdout), `an empty result reads as (empty response): ${JSON.stringify(em2.stdout)}`);
+  ok('#5 a completed-but-empty result is served from cache without re-polling');
+
+  // ---- #6: `#` is a comment only with trailing whitespace; "#1 ..." survives,
+  // and the skipped count is reported on stderr. ----
+  const c6 = path.join(HOME, 'batch-hash.txt');
+  fs.writeFileSync(c6, '# a comment\n#1 cause of failures?\nkeep two\n\n# another comment\n');
+  const r6 = await cli(['batch', c6, '--json']);
+  const j6 = JSON.parse(r6.stdout);
+  assert.deepStrictEqual(
+    j6.submitted.map((s) => s.prompt),
+    ['#1 cause of failures?', 'keep two'],
+    'a "#1 ..." line is a prompt, not a comment; "# ..." lines are skipped'
+  );
+  assert(/skipped 3 blank\/comment lines/.test(r6.stderr), `the skipped count should be noted on stderr: ${r6.stderr}`);
+  ok('#6 batch keeps "#1 ..." prompts, skips "# ..." comments, and reports the count');
+
+  // ---- #7: list -n 0 returns zero rows (not all); watch -i <=0 is rejected. ----
+  assert.strictEqual(JSON.parse(await out(['list', '--json', '-n', '0'])).length, 0, '-n 0 caps to zero rows, not all');
+  const i7Env = { GEMCATCH_HOME: path.join(HOME, 'interval') };
+  const i7 = await submit('SLOW interval victim', [], { env: i7Env });
+  const ivRej = await cli(['watch', i7, '-i', '-5'], { env: i7Env }).catch((e) => e);
+  assert.strictEqual(ivRej.code, 1, 'watch -i -5 should be rejected');
+  assert(/--interval must be a positive number/.test(ivRej.stderr), `expected interval validation: ${ivRej.stderr}`);
+  ok('#7 list -n 0 returns zero rows; watch -i <=0 is rejected');
+
+  // ---- #8: export gathers a tag's completed prompts + results (md/json/-o). ----
+  const xpEnv = { GEMCATCH_HOME: path.join(HOME, 'export') };
+  const xp1 = await submit('first export question', ['-t', 'expt'], { env: xpEnv });
+  const xp2 = await submit('second export question', ['-t', 'expt'], { env: xpEnv });
+  await cliTimeout(['watch', xp1, '-i', '0.02'], { env: xpEnv }, 15000);
+  await cliTimeout(['watch', xp2, '-i', '0.02'], { env: xpEnv }, 15000);
+  const md = await out(['export', '--tag', 'expt', '--format', 'md'], { env: xpEnv });
+  assert(md.includes('## first export question') && md.includes('## second export question'), `each prompt should be a heading: ${md}`);
+  const answerHits = (md.match(new RegExp(ANSWER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+  assert.strictEqual(answerHits, 2, 'both completed results should appear in the export');
+  assert(md.includes(xp1) && md.includes(xp2), 'each section carries its task id');
+  assert(md.indexOf('first export question') < md.indexOf('second export question'), 'export reads oldest-first');
+  const jx = JSON.parse(await out(['export', '--tag', 'expt', '--format', 'json'], { env: xpEnv }));
+  assert.strictEqual(jx.length, 2, 'json export has one object per result');
+  assert.strictEqual(jx[0].result, ANSWER, 'json export carries the result text');
+  const xpFile = path.join(xpEnv.GEMCATCH_HOME, 'out.md');
+  const xpo = await cli(['export', '--tag', 'expt', '-o', xpFile], { env: xpEnv });
+  assert(fs.existsSync(xpFile) && fs.readFileSync(xpFile, 'utf8').includes(ANSWER), '-o writes the export to a file');
+  assert(/Wrote 2 result/.test(xpo.stderr), 'the -o confirmation goes to stderr, not the file');
+  ok('#8 export gathers a tag\'s completed prompts + results as md/json and to a file');
+
+  // ---- digest: synthesize a tag's completed results through one Gemini call. ----
+  const dg = await cliTimeout(['digest', '--tag', 'expt'], { env: xpEnv }, 15000);
+  assert.strictEqual(dg.code, 0, `digest should succeed: ${dg.stderr}`);
+  assert.strictEqual(dg.stdout.trim(), ANSWER, 'digest prints the synthesized result on stdout');
+  assert(/Digesting 2 result/.test(dg.stderr), 'digest reports what it is summarizing on stderr');
+  assert.strictEqual(
+    JSON.parse(await out(['list', '--json', '--tag', 'expt-digest'], { env: xpEnv })).length,
+    1,
+    'the digest lands under <tag>-digest, not the source tag'
+  );
+  ok('digest feeds a tag\'s completed results through one Gemini call into a single summary');
+
+  // ---- #3: the default SDK transport, exercised against a stubbed @google/genai.
+  // Every test above forces GEMCATCH_FORCE_REST=1, so sdkInteractions() is
+  // otherwise never covered. Inject a stub client and drive it directly. ----
+  {
+    const genaiPath = require.resolve('@google/genai');
+    const geminiPath = require.resolve('./gemini');
+    const sdkState = new Map();
+    let sdkSeq = 0;
+    class StubGenAI {
+      constructor(cfg) {
+        assert(cfg && cfg.apiKey, 'the SDK client must be built with an apiKey');
+        this.interactions = {
+          create: async (body) => {
+            assert.strictEqual(body.background, true, 'SDK submit must pass background:true');
+            assert.strictEqual(typeof body.input, 'string', 'SDK input must be a plain string');
+            const id = `sdk_${++sdkSeq}`;
+            sdkState.set(id, { polls: /SLOW/.test(body.input) ? 1 : 0, boom: /BOOM/.test(body.input) });
+            return { id, status: 'in_progress' };
+          },
+          get: async (id) => {
+            const s = sdkState.get(id);
+            if (s.boom) {
+              // Mimic the SDK's real failure shape: a useless stub .message plus
+              // Google's true payload as a JSON string on .body -- exactly what
+              // friendly() unwraps into a readable error.
+              const e = new Error('400 API error occurred: {"httpMeta":{}}');
+              e.status = 400;
+              e.body = JSON.stringify({ error: { code: 400, message: 'Unknown model id via SDK.' } });
+              throw e;
+            }
+            if (s.polls > 0) {
+              s.polls -= 1;
+              return { id, status: 'in_progress' };
+            }
+            // The SDK synthesises output_text; return one so shape() prefers it.
+            return { id, status: 'completed', output_text: ANSWER, usage: { total_tokens: 7 } };
+          },
+        };
+      }
+    }
+    const saved = {
+      key: process.env.GEMINI_API_KEY,
+      force: process.env.GEMCATCH_FORCE_REST,
+      rpm: process.env.GEMCATCH_RPM,
+    };
+    process.env.GEMINI_API_KEY = 'TEST_KEY';
+    delete process.env.GEMCATCH_FORCE_REST; // let the SDK path win over the fallback
+    process.env.GEMCATCH_RPM = '0'; // no pacing for these in-process calls
+    require.cache[genaiPath] = { id: genaiPath, filename: genaiPath, loaded: true, exports: { GoogleGenAI: StubGenAI } };
+    delete require.cache[geminiPath]; // reload so sdkInteractions() memoizes the stub
+    const sdk = require('./gemini');
+
+    const s = await sdk.submit('SLOW via the sdk', { model: 'gemini-3.1-flash' });
+    assert.strictEqual(s.status, 'in_progress', 'SDK submit returns in_progress');
+    assert(/^sdk_/.test(s.interactionId), `shape() must read id off the SDK response: ${s.interactionId}`);
+    let p = await sdk.poll(s.interactionId);
+    assert.strictEqual(p.status, 'in_progress', 'first SDK poll is still running');
+    p = await sdk.poll(s.interactionId);
+    assert.strictEqual(p.status, 'completed', 'second SDK poll completes');
+    assert.strictEqual(p.text, ANSWER, 'shape() prefers the SDK-synthesised output_text');
+    assert.strictEqual(p.usage.total_tokens, 7, 'shape() carries usage through the SDK path');
+
+    const boom = await sdk.submit('BOOM').then((r) => sdk.poll(r.interactionId)).catch((e) => e);
+    assert(/Unknown model id via SDK/.test(boom.message), `friendly() must surface the SDK's real payload: ${boom.message}`);
+    assert.strictEqual(boom.httpStatus, 400, 'friendly() maps the SDK error to its HTTP status');
+
+    // Restore: nothing after this should see the stub or the fake key.
+    delete require.cache[geminiPath];
+    delete require.cache[genaiPath];
+    if (saved.key === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = saved.key;
+    if (saved.force === undefined) delete process.env.GEMCATCH_FORCE_REST;
+    else process.env.GEMCATCH_FORCE_REST = saved.force;
+    if (saved.rpm === undefined) delete process.env.GEMCATCH_RPM;
+    else process.env.GEMCATCH_RPM = saved.rpm;
+    ok('#3 SDK transport: submit -> poll -> completed and a friendly() error, via a stubbed @google/genai');
+  }
 
   server.close();
   fs.rmSync(HOME, { recursive: true, force: true });
