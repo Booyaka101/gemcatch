@@ -1,6 +1,6 @@
 {
   "name": "gemcatch",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Fire-and-forget CLI for Gemini's Interactions API background execution. Submit long-running research prompts, close your laptop, collect results later.",
   "main": "index.js",
   "bin": {
