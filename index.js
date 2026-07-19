@@ -2,6 +2,7 @@
 'use strict';
 
 const fs = require('fs');
+const crypto = require('crypto');
 const { Command, Option } = require('commander');
 const store = require('./db');
 const gemini = require('./gemini');
@@ -40,6 +41,12 @@ function age(ms) {
 function emit(json, value, human) {
   if (json) console.log(JSON.stringify(value, null, 2));
   else human();
+}
+
+// One-line preview of a prompt for the list/batch columns.
+function snippet(prompt, n = 60) {
+  const s = (prompt || '').replace(/\s+/g, ' ');
+  return s.length > n ? `${s.slice(0, n - 3)}...` : s;
 }
 
 function die(err) {
@@ -168,6 +175,121 @@ program
     }
   });
 
+// --- batch ----------------------------------------------------------------
+
+// Turn a prompts file into a list of prompts. Default: one per line, skipping
+// blank lines and `#` comments. With --separator, split the whole file on that
+// delimiter line instead, so a single prompt can span multiple lines.
+function parsePrompts(text, separator) {
+  if (separator) {
+    const blocks = [];
+    let cur = [];
+    for (const line of text.split(/\r?\n/)) {
+      if (line.trim() === separator) {
+        blocks.push(cur.join('\n').trim());
+        cur = [];
+      } else {
+        cur.push(line);
+      }
+    }
+    blocks.push(cur.join('\n').trim());
+    return blocks.filter(Boolean);
+  }
+  return text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
+}
+
+// Poll just this batch until nothing tagged with it is still in flight, then
+// tally the outcome. Modelled on syncPass (a bounded refresh pass) and
+// watchTask (poll-until-terminal), but scoped to one tag.
+async function watchBatch(tag, intervalMs, json) {
+  const inFlight = () => store.listTasks({ tag }).filter((t) => t.interaction_id && !isDone(t.status));
+  let pending = inFlight();
+  while (pending.length) {
+    // A poll that throws keeps the task's old status; the next pass retries it.
+    await mapLimit(pending, 4, (t) => refresh(t).catch(() => {}));
+    pending = inFlight();
+    if (pending.length) await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  const tasks = store.listTasks({ tag });
+  const completed = tasks.filter((t) => isSuccess(t.status)).length;
+  const failed = tasks.filter((t) => isDone(t.status) && !isSuccess(t.status)).length;
+  emit(json, { tag, completed, failed, total: tasks.length }, () =>
+    console.log(dim(`Batch ${tag}: ${completed}/${tasks.length} completed, ${failed} failed.`))
+  );
+}
+
+program
+  .command('batch')
+  .argument('<file>', 'prompts file — one per line, or "-" to read stdin')
+  .option('-m, --model <id>', 'model to use', gemini.DEFAULT_MODEL)
+  .option('-s, --system <text>', 'system instruction')
+  .option('-t, --tag <tag>', 'tag the whole batch (default: batch-<hex>)')
+  .option('--separator <str>', 'split the file on this delimiter line for multi-line prompts')
+  .option('-w, --watch', 'submit all, then poll until the whole batch finishes')
+  .option('--dry-run', 'parse and list what would be submitted; submit nothing')
+  .option('--json', 'machine-readable output')
+  .description('submit many background tasks from a file, tagged as one batch')
+  .action(async (file, opts) => {
+    try {
+      const text = file === '-' ? await readStdin() : fs.readFileSync(file, 'utf8');
+      const prompts = parsePrompts(text, opts.separator);
+      if (!prompts.length) throw new Error(`no prompts found in ${file === '-' ? 'stdin' : file}`);
+      // Auto-tag so the batch is collectable as a unit; a user tag wins.
+      const tag = opts.tag || `batch-${crypto.randomUUID().slice(0, 6)}`;
+
+      if (opts.dryRun) {
+        emit(opts.json, { tag, dry_run: true, prompts }, () => {
+          console.log(`Batch ${tag}: ${prompts.length} prompt(s) would be submitted:`);
+          for (const p of prompts) console.log(`  ${snippet(p)}`);
+        });
+        return;
+      }
+
+      // One failed submit must not sink the batch: mark that task failed and
+      // keep going. mapLimit preserves input order, so the report is stable.
+      const results = await mapLimit(prompts, 4, async (prompt) => {
+        const id = store.createTask({ prompt, model: opts.model, systemInstruction: opts.system, tag });
+        try {
+          const r = await gemini.submit(prompt, { model: opts.model, systemInstruction: opts.system });
+          store.setInteraction(id, r.interactionId, r.status);
+          return { id, interaction_id: r.interactionId, status: r.status, prompt };
+        } catch (err) {
+          store.setStatus(id, 'failed', { error: err.message });
+          return { id, interaction_id: null, status: 'failed', prompt, error: err.message };
+        }
+      });
+      const submitted = results.filter((r) => !r.error);
+      const failed = results.filter((r) => r.error);
+
+      if (opts.watch) {
+        // The submit lines are progress, not the answer, so they go to stderr.
+        if (!opts.json) {
+          console.error(`Batch ${tag}: submitted ${submitted.length} task(s)` + (failed.length ? `, ${failed.length} failed` : '') + '. Watching...');
+        }
+        await watchBatch(tag, DEFAULT_POLL_MS, opts.json);
+        return;
+      }
+
+      emit(opts.json, { tag, submitted, failed }, () => {
+        console.log(`Batch ${tag}: submitted ${submitted.length} task(s)` + (failed.length ? `, ${failed.length} failed` : '') + '.');
+        for (const r of results) {
+          const status = r.status || PENDING;
+          // Pad before colouring: ANSI codes would break the column width.
+          const pad = ' '.repeat(Math.max(0, 16 - status.length));
+          console.log(`${r.id}  ${colorStatus(status)}${pad} ${snippet(r.prompt)}`);
+        }
+        console.log(dim('\nCollect them:'));
+        console.log(dim('  gemcatch daemon --exit-when-idle'));
+        console.log(dim(`  gemcatch list --tag ${tag} --status completed`));
+      });
+    } catch (err) {
+      die(err);
+    }
+  });
+
 // --- status ---------------------------------------------------------------
 
 program
@@ -246,8 +368,7 @@ program
     }
     console.log(dim('ID        AGE   STATUS           PROMPT'));
     for (const t of tasks) {
-      const prompt = (t.prompt || '').replace(/\s+/g, ' ');
-      const snip = prompt.length > 60 ? `${prompt.slice(0, 57)}...` : prompt;
+      const snip = snippet(t.prompt);
       const status = t.status || PENDING;
       // Pad before colouring: ANSI codes would break the column width.
       const pad = ' '.repeat(Math.max(0, 16 - status.length));
