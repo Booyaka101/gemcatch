@@ -55,6 +55,7 @@ const server = http.createServer((req, res) => {
       const id = `int_${++seq}`;
       interactions.set(id, {
         status: 'in_progress',
+        prompt: body.input,
         // SLOW stays in_progress for a couple of polls; FAIL and FLAKY resolve
         // on the first successful one so both paths are reachable in a single
         // `get`.
@@ -107,12 +108,18 @@ const server = http.createServer((req, res) => {
     }
     if (it.status === 'cancelled') return send(200, { id: idPart, status: 'cancelled' });
     if (it.fails) return send(200, { id: idPart, status: 'failed', usage: { total_tokens: 3 } });
-    // No output_text on REST: text must be recovered from steps.
+    // No output_text on REST: text must be recovered from steps. The real API
+    // interleaves the echoed prompt and the model's reasoning with the answer,
+    // so the mock does too -- only the model_output text may come back.
     return send(200, {
       id: idPart,
       status: 'completed',
       usage: { total_tokens: 42 },
-      steps: [{ type: 'model_output', content: { parts: [{ text: it.text }] } }],
+      steps: [
+        { type: 'user_input', content: [{ type: 'text', text: it.prompt || 'echoed prompt' }] },
+        { type: 'thought', signature: 'redacted' },
+        { type: 'model_output', content: { parts: [{ text: it.text }] } },
+      ],
     });
   }
   send(405, { error: { code: 405, message: 'method not allowed' } });
@@ -184,6 +191,18 @@ async function submit(prompt, args, extra) {
   assert.strictEqual(gemini.textOf({ steps: [{ content: { parts: [{ text: 'a' }, { text: 'b' }] } }] }), 'a\nb');
   assert.strictEqual(gemini.textOf({ steps: [] }), '');
   assert.strictEqual(gemini.textOf({}), '');
+  // Only model_output is the answer: the echoed prompt and the reasoning are
+  // skipped, or they get prepended to the result (real bug, seen live).
+  assert.strictEqual(
+    gemini.textOf({
+      steps: [
+        { type: 'user_input', content: [{ type: 'text', text: 'the prompt' }] },
+        { type: 'thought', content: [{ type: 'text', text: 'let me think' }] },
+        { type: 'model_output', content: { parts: [{ text: 'the answer' }] } },
+      ],
+    }),
+    'the answer'
+  );
   ok('textOf prefers output_text, falls back to steps');
 
   // A 4xx is a bad request and will fail identically forever; retrying it just

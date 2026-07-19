@@ -169,11 +169,30 @@ function collectText(node, acc) {
   return acc;
 }
 
+// A REST interaction's `steps` interleaves the echoed prompt and the model's
+// internal reasoning with the actual answer, each tagged by `type`:
+//   [ {type:'user_input', ...}, {type:'thought', ...}, {type:'model_output', ...} ]
+// Collecting text indiscriminately prepends the prompt (and any reasoning) to
+// the result, so those step types are skipped. Anything else -- model_output,
+// an untyped step, a future answer-bearing type -- still contributes, so a
+// renamed step never silently blanks the result.
+const NON_ANSWER_STEP = new Set(['user_input', 'thought']);
+
+function textFromSteps(steps) {
+  if (!Array.isArray(steps)) return '';
+  const acc = [];
+  for (const step of steps) {
+    if (step && NON_ANSWER_STEP.has(step.type)) continue;
+    collectText(step, acc);
+  }
+  return acc.join('\n').trim();
+}
+
 function textOf(interaction) {
   if (interaction && typeof interaction.output_text === 'string' && interaction.output_text) {
     return interaction.output_text;
   }
-  return collectText(interaction && interaction.steps, []).join('\n').trim();
+  return textFromSteps(interaction && interaction.steps);
 }
 
 function shape(r) {
