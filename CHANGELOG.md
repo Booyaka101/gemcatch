@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-19
+
 ### Added
 
 - `gemcatch batch <file>` — submit many background tasks from a file in one
@@ -94,5 +96,7 @@ seen a task complete, the text is cached locally and survives that expiry — bu
 something has to poll inside that window for it to be seen at all, which is what
 `gemcatch daemon` exists to do.
 
-[Unreleased]: https://github.com/Booyaka101/gemcatch/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Booyaka101/gemcatch/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Booyaka101/gemcatch/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/Booyaka101/gemcatch/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Booyaka101/gemcatch/releases/tag/v0.1.0
