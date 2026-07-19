@@ -334,6 +334,71 @@ async function submit(prompt, args, extra) {
   assert.strictEqual(rwj.status, 'completed');
   ok('research --watch --json emits a single final result object');
 
+  // ---- batch: N prompts, one auto tag ----
+  const bfile = path.join(HOME, 'batch1.txt');
+  fs.writeFileSync(bfile, 'batch alpha\nbatch beta\nbatch gamma\n');
+  const bjson = JSON.parse(await out(['batch', bfile, '--json']));
+  assert(/^batch-[0-9a-f]{6}$/.test(bjson.tag), `auto tag should be batch-<6hex>: ${bjson.tag}`);
+  assert.strictEqual(bjson.submitted.length, 3, 'three prompts, three tasks');
+  assert.strictEqual(bjson.failed.length, 0, 'none should fail');
+  const bList = JSON.parse(await out(['list', '--json', '--tag', bjson.tag]));
+  assert.strictEqual(bList.length, 3, 'all three visible under the one batch tag');
+  ok('batch submits N tasks under a single auto-generated tag, collectable via list --tag');
+
+  // ---- batch --json shape ----
+  const bshape = JSON.parse(await out(['batch', bfile, '--json', '-t', 'shape-tag']));
+  assert.deepStrictEqual(Object.keys(bshape).sort(), ['failed', 'submitted', 'tag'], 'top-level keys');
+  assert.deepStrictEqual(
+    Object.keys(bshape.submitted[0]).sort(),
+    ['id', 'interaction_id', 'prompt', 'status'],
+    'each submitted item carries id, interaction_id, status, prompt'
+  );
+  assert.strictEqual(bshape.submitted[0].status, 'in_progress', 'a fresh submit is in_progress');
+  ok('batch --json emits { tag, submitted, failed } with typed submitted items');
+
+  // ---- batch skips blanks and # comments ----
+  const cfile = path.join(HOME, 'batch-comments.txt');
+  fs.writeFileSync(cfile, '# a comment\nkeep one\n\n   \n# another\nkeep two\n');
+  const cj = JSON.parse(await out(['batch', cfile, '--json']));
+  assert.deepStrictEqual(cj.submitted.map((s) => s.prompt), ['keep one', 'keep two'], 'only real, trimmed prompts survive');
+  ok('batch skips blank lines and # comments');
+
+  // ---- batch --separator keeps multi-line prompts whole ----
+  const sfile = path.join(HOME, 'batch-sep.txt');
+  fs.writeFileSync(sfile, 'first line A\nsecond line A\n---\nlone prompt B\n');
+  const sj = JSON.parse(await out(['batch', sfile, '--json', '--separator', '---']));
+  assert.strictEqual(sj.submitted.length, 2, '--separator splits on the delimiter line, not every newline');
+  assert(
+    sj.submitted[0].prompt.includes('first line A') && sj.submitted[0].prompt.includes('\nsecond line A'),
+    `a multi-line prompt must survive intact: ${JSON.stringify(sj.submitted[0].prompt)}`
+  );
+  ok('batch --separator splits multi-line prompts on a delimiter line');
+
+  // ---- batch -t uses the provided tag ----
+  const ct = JSON.parse(await out(['batch', bfile, '--json', '-t', 'mytag']));
+  assert.strictEqual(ct.tag, 'mytag', 'a provided tag is used verbatim, no batch- prefix');
+  assert.strictEqual(JSON.parse(await out(['list', '--json', '--tag', 'mytag'])).length, 3, 'tasks land under the provided tag');
+  ok('batch -t mytag tags every task with the provided tag');
+
+  // ---- batch --dry-run submits nothing ----
+  const dfile = path.join(HOME, 'batch-dry.txt');
+  fs.writeFileSync(dfile, 'dry one\ndry two\n');
+  const dryOut = await out(['batch', dfile, '--dry-run']);
+  const dryTag = (dryOut.match(/Batch (\S+):/) || [])[1];
+  assert(dryTag, `dry-run should print a tag: ${dryOut}`);
+  assert(dryOut.includes('dry one') && dryOut.includes('dry two'), 'dry-run lists the prompts it would submit');
+  assert.strictEqual(JSON.parse(await out(['list', '--json', '--tag', dryTag])).length, 0, 'dry-run must create no tasks');
+  ok('batch --dry-run lists prompts but submits nothing');
+
+  // ---- batch --watch drives the whole batch to terminal, then tallies ----
+  const wfile = path.join(HOME, 'batch-watch.txt');
+  fs.writeFileSync(wfile, 'SLOW batch one\nSLOW batch two\n');
+  const bw = JSON.parse((await cli(['batch', wfile, '-w', '--json'])).stdout);
+  assert.strictEqual(bw.total, 2, 'the summary counts the whole batch');
+  assert.strictEqual(bw.completed, 2, `--watch should drive both to completed: ${JSON.stringify(bw)}`);
+  assert.strictEqual(bw.failed, 0);
+  ok('batch --watch polls the whole batch to completion, then tallies');
+
   // ---- retry on a transient 503 ----
   const flaky = await submit('FLAKY please');
   const before503 = flaky503s;

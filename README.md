@@ -79,6 +79,7 @@ This week in AI: ...
 | Command | What it does |
 | --- | --- |
 | `gemcatch research "<prompt>"` | Submits with `background: true`, stores the interaction ID, exits immediately. |
+| `gemcatch batch <file>` | Submits many prompts from a file at once, tagged as one collectable batch. |
 | `gemcatch status <id>` | Polls the API and prints the current state. |
 | `gemcatch get <id>` | Prints the full response if complete, otherwise the current status. |
 | `gemcatch list` | All tasks, newest first: id, age, status, prompt. |
@@ -95,15 +96,16 @@ Useful flags:
 | Flag | On | Does |
 | --- | --- | --- |
 | `--json` | most commands | Machine-readable output. |
-| `-m, --model <id>` | `research` | Override the model. |
-| `-s, --system <text>` | `research` | Set a system instruction. |
+| `-m, --model <id>` | `research`, `batch` | Override the model. |
+| `-s, --system <text>` | `research`, `batch` | Set a system instruction. |
 | `-f, --file <path>` | `research` | Read the prompt from a file. |
-| `-t, --tag <tag>` | `research`, `list` | Label tasks and filter them. |
-| `-w, --watch` | `research` | Submit and wait, in one command. |
+| `-t, --tag <tag>` | `research`, `batch`, `list` | Label tasks and filter them. |
+| `-w, --watch` | `research`, `batch` | Submit and wait, in one command. |
+| `--separator <str>` | `batch` | Split the file on this delimiter line for multi-line prompts. |
 | `-i, --interval <s>` | `watch`, `daemon` | Poll rate. Default 10s for `watch`, 300s for `daemon`. |
 | `--exit-when-idle` | `daemon` | Stop once nothing is left in flight. |
 | `-n, --limit <n>` | `list` | Cap the rows. |
-| `--dry-run` | `prune` | Show what would go; delete nothing. |
+| `--dry-run` | `batch`, `prune` | Show what would go; submit/delete nothing. |
 | `--raw` | `get` | Dump the raw interaction JSON. |
 
 IDs are the first 8 characters of a UUID. Any unique prefix works, so `gemcatch get 8f3a` is fine.
@@ -113,7 +115,17 @@ Statuses come straight from the API: `in_progress`, `requires_action`, `complete
 ## Recipes
 
 ```bash
-# Fire off a batch, then collect later
+# Fire off a whole file of prompts in one command, then collect later.
+# Every task shares one auto-generated tag (batch-xxxxxx), printed on submit.
+$ gemcatch batch questions.txt        # one prompt per line; # and blanks skipped
+$ gemcatch daemon --exit-when-idle    # keep polling until they're all in
+$ gemcatch list --tag batch-1a2b3c --status completed
+
+# Multi-line prompts: split the file on a delimiter line instead of per-line
+$ gemcatch batch briefs.md --separator ---
+$ gemcatch batch - < questions.txt    # or pipe the list in on stdin
+
+# The same thing by hand, if you prefer a loop
 $ for q in "topic A" "topic B" "topic C"; do gemcatch research "$q" -t batch1; done
 $ gemcatch sync                       # one pass now...
 $ gemcatch daemon --exit-when-idle    # ...or keep polling until they're all in

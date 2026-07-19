@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `gemcatch batch <file>` — submit many background tasks from a file in one
+  command. One prompt per non-empty line by default (`#` comments and blanks are
+  skipped); `--separator <str>` splits the file on a delimiter line so prompts
+  can span multiple lines; `-` reads the list from stdin. The whole batch is
+  tagged as a unit — `-t/--tag` sets it, otherwise an auto tag `batch-<hex>` is
+  generated and printed — so it is collectable with `gemcatch list --tag`.
+  Submissions are bounded but concurrent (four at a time, paced by `GEMCATCH_RPM`),
+  and a single failed submit is marked `failed` and reported without sinking the
+  rest of the batch. Supports `-m/--model`, `-s/--system`, `--dry-run` (parse and
+  list, submit nothing), `--json`, and `-w/--watch` (poll the batch to completion,
+  then print a combined tally).
+
 ## [0.1.1] - 2026-07-19
 
 ### Fixed
