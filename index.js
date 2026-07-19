@@ -13,20 +13,41 @@ const DEFAULT_POLL_MS = Number(process.env.GEMCATCH_POLL_MS) || 10000;
 // comfortably faster than that. Five minutes is far inside the margin and
 // costs a handful of requests an hour.
 const DEFAULT_DAEMON_S = Number(process.env.GEMCATCH_DAEMON_S) || 300;
+// A watch loop must not spin forever on a task the server can no longer resolve
+// -- a wedged in_progress, or transient poll errors that never clear. `watch`
+// and `batch -w` give up after this many *consecutive* poll failures (a clean
+// poll resets the run), surfacing a clear message and a non-zero exit instead
+// of hanging. The daemon, meant to run for days, is bounded differently: a 404
+// retires the task locally (see refresh) so it simply leaves the active set.
+const WATCH_MAX_FAILS = Number(process.env.GEMCATCH_WATCH_MAX_FAILS) || 10;
 const ALL_STATUSES = [PENDING].concat(ACTIVE, TERMINAL);
 
 // --- output ---------------------------------------------------------------
 
-const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
-const paint = (code, s) => (useColor ? `[${code}m${s}[0m` : s);
-const dim = (s) => paint('2', s);
+// Colour is decided per stream. Progress and status chatter go to stderr
+// (watch/daemon/research -w); results and tables go to stdout. Each stream keys
+// its ANSI on its *own* TTY-ness, so redirecting one (`gemcatch watch x > out.txt`)
+// neither strips colour from the other nor leaks raw escape codes into the
+// redirected file. NO_COLOR disables both.
+const NO_COLOR = !!process.env.NO_COLOR;
+const useColor = process.stdout.isTTY && !NO_COLOR; // stdout-bound colour
+const useColorErr = process.stderr.isTTY && !NO_COLOR; // stderr-bound colour
 
-function colorStatus(s) {
-  if (isSuccess(s)) return paint('32', s); // green
-  if (s === 'in_progress' || s === PENDING) return paint('36', s); // cyan
-  if (s === 'requires_action') return paint('33', s); // yellow
-  return paint('31', s); // red: failed/cancelled/incomplete/budget_exceeded
+const wrap = (on) => (code, s) => (on ? `[${code}m${s}[0m` : s);
+const paint = wrap(useColor); // paints for stdout
+const epaint = wrap(useColorErr); // paints for stderr
+const dim = (s) => paint('2', s);
+const edim = (s) => epaint('2', s);
+
+// Status colour keyed to a given painter, so one rule set serves both streams.
+function tint(pnt, s) {
+  if (isSuccess(s)) return pnt('32', s); // green
+  if (s === 'in_progress' || s === PENDING) return pnt('36', s); // cyan
+  if (s === 'requires_action') return pnt('33', s); // yellow
+  return pnt('31', s); // red: failed/cancelled/incomplete/budget_exceeded
 }
+const colorStatus = (s) => tint(paint, s); // for stdout
+const ecolorStatus = (s) => tint(epaint, s); // for stderr
 
 const hhmmss = () => new Date().toISOString().slice(11, 19);
 
@@ -100,7 +121,22 @@ async function resolvePrompt(arg, opts) {
 // Poll one task and persist whatever came back.
 async function refresh(task) {
   if (!task.interaction_id) return { status: task.status, text: null, usage: null };
-  const r = await gemini.poll(task.interaction_id);
+  let r;
+  try {
+    r = await gemini.poll(task.interaction_id);
+  } catch (err) {
+    // A 404 is genuine and permanent: the interaction is gone -- dropped after
+    // the free tier's 24h retention, or deleted -- and it will 404 identically
+    // forever (a 4xx never retries). Retire the task locally so it leaves the
+    // active set, instead of the daemon or a watch loop polling a ghost until
+    // the end of time. Any other error (5xx, network) is transient and is
+    // re-thrown for the caller to retry on its next pass.
+    if (err && err.httpStatus === 404) {
+      store.setStatus(task.id, 'incomplete', { error: 'interaction not found (expired or deleted)' });
+      return { status: 'incomplete', text: null, usage: null, raw: null };
+    }
+    throw err;
+  }
   const extra = {};
   if (isDone(r.status)) {
     if (isSuccess(r.status)) extra.result = r.text;
@@ -162,7 +198,7 @@ program
         // Under --watch the submit line is progress, not the answer, so it
         // goes to stderr -- `gemcatch research -w "..." > out.txt` then captures
         // only the result.
-        if (!opts.json) console.error(dim(`Task ${id} submitted.`));
+        if (!opts.json) console.error(edim(`Task ${id} submitted.`));
         await watchTask(store.getTask(id), DEFAULT_POLL_MS, opts.json);
         return;
       }
@@ -170,16 +206,29 @@ program
         console.log(`Task ${id} submitted. Run: gemcatch get ${id} when ready.`)
       );
     } catch (err) {
-      if (id) store.setStatus(id, 'failed', { error: err.message });
+      // Only a failed *submit* should mark the task failed. Once it has an
+      // interaction_id it is live on the server, and a later watch/poll error
+      // must never overwrite it to failed -- that would drop it from the active
+      // set and the daemon would abandon a task whose result is still coming.
+      // Leave it active; the daemon (or a later `get`) collects it.
+      if (id) {
+        const t = store.getTask(id);
+        if (!t || !t.interaction_id) store.setStatus(id, 'failed', { error: err.message });
+      }
       die(err);
     }
   });
 
 // --- batch ----------------------------------------------------------------
 
-// Turn a prompts file into a list of prompts. Default: one per line, skipping
-// blank lines and `#` comments. With --separator, split the whole file on that
+// Turn a prompts file into a list of prompts, plus a count of the lines it
+// dropped so the caller can note them. Default: one per line, skipping blank
+// lines and `#` comments. With --separator, split the whole file on that
 // delimiter line instead, so a single prompt can span multiple lines.
+//
+// A `#` is a comment only when followed by whitespace (`# like this`). A line
+// such as `#1 cause of X?` is a real prompt, not a comment, and must survive --
+// treating every leading `#` as a comment silently swallowed those.
 function parsePrompts(text, separator) {
   if (separator) {
     const blocks = [];
@@ -193,12 +242,20 @@ function parsePrompts(text, separator) {
       }
     }
     blocks.push(cur.join('\n').trim());
-    return blocks.filter(Boolean);
+    const prompts = blocks.filter(Boolean);
+    return { prompts, skipped: blocks.length - prompts.length };
   }
-  return text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith('#'));
+  // The file almost always ends in a newline; that trailing empty line is not a
+  // blank the user wrote, so it does not count towards the skipped tally.
+  const lines = text.split(/\r?\n/).map((l) => l.trim());
+  while (lines.length && lines[lines.length - 1] === '') lines.pop();
+  const prompts = [];
+  let skipped = 0;
+  for (const l of lines) {
+    if (!l || /^#\s/.test(l)) skipped += 1;
+    else prompts.push(l);
+  }
+  return { prompts, skipped };
 }
 
 // Poll just this batch until nothing tagged with it is still in flight, then
@@ -207,11 +264,25 @@ function parsePrompts(text, separator) {
 async function watchBatch(tag, intervalMs, json) {
   const inFlight = () => store.listTasks({ tag }).filter((t) => t.interaction_id && !isDone(t.status));
   let pending = inFlight();
+  let stalls = 0; // consecutive passes that resolved nothing
   while (pending.length) {
     // A poll that throws keeps the task's old status; the next pass retries it.
+    // A 404 retires the task inside refresh, so it drops out of `inFlight`.
     await mapLimit(pending, 4, (t) => refresh(t).catch(() => {}));
-    pending = inFlight();
-    if (pending.length) await new Promise((r) => setTimeout(r, intervalMs));
+    const next = inFlight();
+    // Forward progress = the in-flight set shrank. A pass that resolves nothing
+    // -- every poll erroring, or a wedged in_progress that never moves -- is a
+    // stall; enough of those in a row means give up rather than loop forever.
+    stalls = next.length < pending.length ? 0 : stalls + 1;
+    pending = next;
+    if (!pending.length) break;
+    if (stalls >= WATCH_MAX_FAILS) {
+      const msg = `Batch ${tag}: gave up after ${stalls} passes with no progress; ${pending.length} task(s) unresolved.`;
+      emit(json, { tag, error: msg, unresolved: pending.length }, () => console.error(edim(msg)));
+      process.exitCode = 1;
+      return;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
   }
   const tasks = store.listTasks({ tag });
   const completed = tasks.filter((t) => isSuccess(t.status)).length;
@@ -235,8 +306,13 @@ program
   .action(async (file, opts) => {
     try {
       const text = file === '-' ? await readStdin() : fs.readFileSync(file, 'utf8');
-      const prompts = parsePrompts(text, opts.separator);
+      const { prompts, skipped } = parsePrompts(text, opts.separator);
       if (!prompts.length) throw new Error(`no prompts found in ${file === '-' ? 'stdin' : file}`);
+      // A one-line heads-up so a swallowed prompt (or a stray comment) is never a
+      // silent mystery. Goes to stderr so it can't corrupt --json on stdout.
+      if (skipped) {
+        console.error(edim(`(skipped ${skipped} blank/comment line${skipped === 1 ? '' : 's'})`));
+      }
       // Auto-tag so the batch is collectable as a unit; a user tag wins.
       const tag = opts.tag || `batch-${crypto.randomUUID().slice(0, 6)}`;
 
@@ -321,10 +397,13 @@ program
     const task = needTask(id);
     try {
       // Completed tasks are served from SQLite -- no network, and it still
-      // works after the free tier drops the interaction at 24h.
-      if (isSuccess(task.status) && task.result && !opts.raw) {
+      // works after the free tier drops the interaction at 24h. Gate on the
+      // result being *present*, not truthy: a task that completes with empty
+      // text stores `''`, which is exactly the case the cache must still serve
+      // -- re-polling it would 404 after 24h, the very thing we cache to avoid.
+      if (isSuccess(task.status) && task.result != null && !opts.raw) {
         emit(opts.json, { id: task.id, status: task.status, result: task.result }, () =>
-          console.log(task.result)
+          console.log(task.result || '(empty response)')
         );
         return;
       }
@@ -360,6 +439,11 @@ program
   .option('--json', 'machine-readable output')
   .description('all tasks, newest first')
   .action((opts) => {
+    // `-n 0` is a valid cap (show nothing); a negative would become SQLite's
+    // "no limit" (LIMIT -1 = all rows), so reject anything but a non-negative int.
+    if (opts.limit != null && (!Number.isInteger(opts.limit) || opts.limit < 0)) {
+      return die(new Error(`--limit must be a non-negative integer (got ${opts.limit})`));
+    }
     const tasks = store.listTasks({ status: opts.status, tag: opts.tag, limit: opts.limit });
     if (opts.json) return console.log(JSON.stringify(tasks, null, 2));
     if (!tasks.length) {
@@ -375,6 +459,117 @@ program
       console.log(
         `${t.id}  ${age(t.created_at).padEnd(4)}  ${colorStatus(status)}${pad} ${snip}`
       );
+    }
+  });
+
+// --- export ---------------------------------------------------------------
+
+// Collect many finished results into one document -- the "gather" that pairs
+// with `batch`'s "scatter". Where `get` prints one result at a time, `export`
+// concatenates a whole tag (or status) under prompt headings, to stdout or a
+// file, as Markdown (default) or JSON.
+program
+  .command('export')
+  .option('-t, --tag <tag>', 'only this tag')
+  .addOption(new Option('--status <status>', 'only this status').choices(ALL_STATUSES).default('completed'))
+  .addOption(new Option('--format <fmt>', 'output format').choices(['md', 'json']).default('md'))
+  .option('-o, --out <file>', 'write to a file instead of stdout')
+  .description('concatenate finished results, each under its prompt, to stdout or a file')
+  .action((opts) => {
+    const tasks = store.listTasks({ tag: opts.tag, status: opts.status });
+    // Newest-first suits a listing, but an export reads top-to-bottom like a
+    // document, so oldest-first is the natural order here.
+    tasks.reverse();
+    // Only rows that actually carry a result are worth exporting: a status
+    // filter other than `completed` can match tasks that never stored text.
+    const rows = tasks.filter((t) => t.result != null);
+    if (!rows.length) {
+      // Nothing to write isn't an error, but say why so an empty -o file (or an
+      // empty pipe) isn't a mystery. The note goes to stderr, never the output.
+      console.error(`No ${opts.status} results to export${opts.tag ? ` for tag '${opts.tag}'` : ''}.`);
+      return;
+    }
+
+    let output;
+    if (opts.format === 'json') {
+      output = JSON.stringify(
+        rows.map((t) => ({
+          id: t.id,
+          tag: t.tag,
+          status: t.status,
+          prompt: t.prompt,
+          result: t.result,
+          created_at: t.created_at,
+        })),
+        null,
+        2
+      );
+    } else {
+      output = rows
+        .map((t) => {
+          const when = new Date(t.created_at).toISOString().replace('T', ' ').slice(0, 16);
+          const head = (t.prompt || '(no prompt)').replace(/\s+/g, ' ').trim();
+          const body = t.result && t.result.trim() ? t.result : '_(empty result)_';
+          return `## ${head}\n\n\`${t.id}\` · ${t.status} · ${when} UTC\n\n${body}`;
+        })
+        .join('\n\n---\n\n');
+    }
+
+    if (opts.out) {
+      fs.writeFileSync(opts.out, output.endsWith('\n') ? output : `${output}\n`);
+      console.error(`Wrote ${rows.length} result(s) to ${opts.out}.`);
+    } else {
+      console.log(output);
+    }
+  });
+
+// --- digest ---------------------------------------------------------------
+
+// One step past `export`: instead of concatenating a tag's results, feed them
+// back through a single Gemini call and synthesise one summary. It is `research`
+// with a prompt built from what you have already collected, so it submits, then
+// watches to completion just like `research -w`.
+program
+  .command('digest')
+  .requiredOption('-t, --tag <tag>', 'synthesize the completed results under this tag')
+  .option('-m, --model <id>', 'model to use', gemini.DEFAULT_MODEL)
+  .option('-s, --system <text>', 'system instruction for the synthesis')
+  .option('--json', 'machine-readable output')
+  .description("feed a tag's completed results through one Gemini call into a single summary")
+  .action(async (opts) => {
+    let id;
+    try {
+      const done = store
+        .listTasks({ tag: opts.tag, status: 'completed' })
+        .filter((t) => t.result != null && t.result.trim());
+      if (!done.length) {
+        throw new Error(
+          `no completed results tagged '${opts.tag}' to digest.` +
+            ' Collect them first: gemcatch daemon --exit-when-idle'
+        );
+      }
+      done.reverse(); // oldest first, so the sources read in submission order
+      const sources = done
+        .map((t, i) => `## Source ${i + 1}: ${(t.prompt || '').replace(/\s+/g, ' ').trim()}\n\n${t.result}`)
+        .join('\n\n');
+      const prompt =
+        `Synthesize the following ${done.length} research result(s) into one coherent summary.` +
+        ' Note where they agree and disagree, and do not simply repeat each verbatim.\n\n' +
+        sources;
+      // The digest is itself a task, tagged so it is findable but kept out of
+      // the source tag so a later digest never digests its own output.
+      id = store.createTask({ prompt, model: opts.model, systemInstruction: opts.system, tag: `${opts.tag}-digest` });
+      const r = await gemini.submit(prompt, { model: opts.model, systemInstruction: opts.system });
+      store.setInteraction(id, r.interactionId, r.status);
+      if (!opts.json) console.error(edim(`Digesting ${done.length} result(s) tagged ${opts.tag} -> task ${id}.`));
+      await watchTask(store.getTask(id), DEFAULT_POLL_MS, opts.json);
+    } catch (err) {
+      // Same rule as `research`: only a failed *submit* marks the task failed.
+      if (id) {
+        const t = store.getTask(id);
+        if (!t || !t.interaction_id) store.setStatus(id, 'failed', { error: err.message });
+      }
+      die(err);
     }
   });
 
@@ -422,12 +617,18 @@ program
   .option('--json', 'newline-delimited JSON events on stdout')
   .description('poll in-flight tasks on a loop so results are cached before they expire')
   .action(async (opts) => {
-    const intervalMs = Math.max(1000, (opts.interval || DEFAULT_DAEMON_S) * 1000);
+    if (!Number.isFinite(opts.interval) || opts.interval <= 0) {
+      return die(new Error(`--interval must be a positive number of seconds (got ${opts.interval})`));
+    }
+    const intervalMs = Math.max(1000, opts.interval * 1000);
     let stopping = false;
     let wake = null;
     // Finish the pass in progress, then exit cleanly -- never leave a polled
-    // result unwritten because someone hit Ctrl-C.
+    // result unwritten because someone hit Ctrl-C. A *second* signal, though,
+    // means "I don't want to wait for this pass" -- force-exit immediately with
+    // the conventional 130 (128 + SIGINT) so a long paced pass can't trap you.
     const stop = () => {
+      if (stopping) process.exit(130);
       stopping = true;
       if (wake) wake();
     };
@@ -440,7 +641,7 @@ program
 
     if (!opts.json) {
       console.error(
-        dim(`gemcatch daemon: polling every ${intervalMs / 1000}s. Store: ${store.DB_PATH}. Ctrl-C to stop.`)
+        edim(`gemcatch daemon: polling every ${intervalMs / 1000}s. Store: ${store.DB_PATH}. Ctrl-C to stop.`)
       );
     }
     event({ event: 'start', interval_s: intervalMs / 1000, db: store.DB_PATH });
@@ -455,7 +656,7 @@ program
         // the next pass may well succeed, and a daemon that dies silently is
         // worse than one that complains.
         if (opts.json) event({ event: 'error', error: err.message });
-        else console.error(`${dim(`[${hhmmss()}]`)} Error: ${err.message}`);
+        else console.error(`${edim(`[${hhmmss()}]`)} Error: ${err.message}`);
       }
 
       // Quiet by default: only transitions and failures are worth a line.
@@ -465,7 +666,7 @@ program
           event({ event: r.error ? 'error' : 'update', id: r.id, status: r.status, error: r.error || null });
         } else {
           console.error(
-            dim(`[${hhmmss()}] ${r.id}: `) + colorStatus(r.status) + (r.error ? `  ${dim(r.error)}` : '')
+            edim(`[${hhmmss()}] ${r.id}: `) + ecolorStatus(r.status) + (r.error ? `  ${edim(r.error)}` : '')
           );
         }
       }
@@ -488,7 +689,7 @@ program
     }
 
     event({ event: 'stop' });
-    if (!opts.json) console.error(dim('gemcatch daemon: stopped.'));
+    if (!opts.json) console.error(edim('gemcatch daemon: stopped.'));
     store.close();
   });
 
@@ -496,12 +697,32 @@ program
 
 async function watchTask(task, intervalMs, json) {
   let last = null;
+  let fails = 0;
   for (;;) {
-    const r = await refresh(task);
+    let r;
+    try {
+      r = await refresh(task);
+      fails = 0; // a clean poll resets the failure run
+    } catch (err) {
+      // A poll error must not sink a live task: keep its old status and try
+      // again next interval, exactly like watchBatch. Give up only once the
+      // failures pile up, so a task the server can't answer for can't hang the
+      // watch forever. (A 404 doesn't reach here -- refresh retires it and
+      // returns a terminal status, handled below.)
+      fails += 1;
+      if (fails >= WATCH_MAX_FAILS) {
+        const msg = `Gave up watching ${task.id} after ${fails} consecutive poll failures: ${err.message}`;
+        emit(json, { id: task.id, status: task.status, error: msg }, () => console.error(edim(msg)));
+        process.exitCode = 1;
+        return;
+      }
+      await new Promise((r2) => setTimeout(r2, intervalMs));
+      continue;
+    }
     // Status chatter goes to stderr so `gemcatch watch x > out.txt` captures only
     // the result.
     if (r.status !== last && !json) {
-      console.error(dim(`[${new Date().toISOString().slice(11, 19)}] ${task.id}: `) + colorStatus(r.status));
+      console.error(edim(`[${new Date().toISOString().slice(11, 19)}] ${task.id}: `) + ecolorStatus(r.status));
       last = r.status;
     }
     if (isSuccess(r.status)) {
@@ -512,7 +733,7 @@ async function watchTask(task, intervalMs, json) {
     }
     if (isDone(r.status)) {
       emit(json, { id: task.id, status: r.status, error: r.text || null }, () => {
-        console.error(`Task ${task.id} ended: ${colorStatus(r.status)}`);
+        console.error(`Task ${task.id} ended: ${ecolorStatus(r.status)}`);
         if (r.text) console.log(r.text);
       });
       process.exitCode = 1;
@@ -531,11 +752,16 @@ program
   .action(async (id, opts) => {
     const task = needTask(id);
     try {
-      if (isSuccess(task.status) && task.result) {
+      // Serve a completed result from cache -- present, not merely truthy, so an
+      // empty-text completion is served instead of re-polled (and lost at 24h).
+      if (isSuccess(task.status) && task.result != null) {
         emit(opts.json, { id: task.id, status: task.status, result: task.result }, () =>
-          console.log(task.result)
+          console.log(task.result || '(empty response)')
         );
         return;
+      }
+      if (opts.interval != null && (!Number.isFinite(opts.interval) || opts.interval <= 0)) {
+        return die(new Error(`--interval must be a positive number of seconds (got ${opts.interval})`));
       }
       await watchTask(task, opts.interval ? opts.interval * 1000 : DEFAULT_POLL_MS, opts.json);
     } catch (err) {
@@ -579,7 +805,7 @@ program
         } catch (err) {
           // Free-tier interactions vanish after 24h, so a missing remote is
           // normal -- never block the local delete on it.
-          console.error(dim(`  (remote delete failed for ${task.id}: ${err.message})`));
+          console.error(edim(`  (remote delete failed for ${task.id}: ${err.message})`));
         }
       }
       if (store.removeTask(task.id)) removed += 1;
@@ -595,6 +821,12 @@ program
   .option('--dry-run', 'list what would go, delete nothing')
   .description('drop old finished tasks (in-flight work is never touched)')
   .action((opts) => {
+    // A negative (or non-numeric) --days puts the cutoff in the *future*, which
+    // would match every finished task and quietly wipe the lot. Refuse it: the
+    // cutoff must be at or before now.
+    if (!Number.isFinite(opts.days) || opts.days < 0) {
+      return die(new Error(`--days must be a non-negative number (got ${opts.days})`));
+    }
     const cutoff = Date.now() - opts.days * 86400000;
     const doomed = store.prunableTasks(cutoff);
     if (!doomed.length) {
@@ -625,5 +857,17 @@ program
       for (const r of rows) console.log(`  ${colorStatus(r.status).padEnd(useColor ? 26 : 17)} ${r.n}`);
     });
   });
+
+// Close the store on the way out so a one-shot command doesn't leave the
+// SQLite -wal/-shm sidecars lingering. The store opens lazily, so if a command
+// never touched it this is a no-op; the daemon closes explicitly too, and a
+// second close is harmless.
+process.on('exit', () => {
+  try {
+    store.close();
+  } catch (_) {
+    /* best effort on the way out */
+  }
+});
 
 program.parseAsync(process.argv).catch(die);

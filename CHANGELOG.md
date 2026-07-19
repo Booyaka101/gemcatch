@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-19
+
+### Added
+
+- `gemcatch export [--tag <t>] [--status <s>] [--format md|json] [-o <file>]` —
+  concatenate finished results into one document, each under a heading with its
+  prompt, id and date. Markdown by default (or JSON for `jq`), to stdout or a
+  file. This is the "gather" step that pairs with `batch`'s "scatter": where
+  `get` prints one result at a time, `export` collects a whole tag at once.
+- `gemcatch digest --tag <t>` — feed a tag's completed results back through a
+  single Gemini call to synthesise one summary. Submits like `research` and
+  watches to completion; the summary lands under `<tag>-digest`.
+- `GEMCATCH_WATCH_MAX_FAILS` (default 10) — the consecutive-poll-failure bound
+  at which `watch` and `batch -w` give up rather than loop forever.
+
+### Fixed
+
+- `research --watch` no longer marks a **successfully submitted, server-running**
+  task `failed` when a poll errors during the watch. A transient poll failure (a
+  5xx past its retries, a network blip) or an expiry mid-watch would propagate to
+  the submit handler and overwrite the status to `failed`, dropping the task from
+  the active set so the daemon abandoned it and the result was lost. The watch
+  loop now rides out poll errors (retrying on the next interval), and only a
+  failed *submit* — a task with no `interaction_id` yet — is ever marked `failed`.
+- A wedged or expired interaction no longer keeps a task in flight forever. When a
+  poll returns **404** (the free tier drops interactions after 24h, or one was
+  deleted), the task is retired locally to `incomplete` with a recorded reason, so
+  it leaves the active set and `daemon --exit-when-idle` converges. `watch` and
+  `batch -w` additionally stop after `GEMCATCH_WATCH_MAX_FAILS` consecutive poll
+  failures (or a stalled batch), with a clear message and a non-zero exit, instead
+  of spinning.
+- A **completed-but-empty** result is now served from the local cache. `get` and
+  `watch` gated the cache hit on the result being truthy, so a task that completed
+  with empty text (`''`) skipped the cache, re-polled, and 404'd after 24h — the
+  exact loss the daemon exists to prevent. The gate is now on presence
+  (`result != null`), not truthiness.
+- `prune -d <negative>` (or a non-numeric `--days`) is rejected instead of putting
+  the cutoff in the future and deleting **every** finished task. `--days` must now
+  be a non-negative number.
+- `batch` no longer silently drops a prompt line that starts with `#`. A `#` is a
+  comment only when followed by whitespace (`# like this`); a line such as
+  `#1 cause of X?` is a real prompt and survives. When comment or blank lines are
+  skipped, a one-line count is noted on stderr.
+- `watch -i` / `daemon -i` reject a non-positive interval (`-i -5` busy-looped,
+  `-i 0` silently fell back to the default). `list -n 0` now returns zero rows
+  instead of all of them, and `-n` rejects negatives (which SQLite reads as "no
+  limit").
+- A second `Ctrl-C` to the daemon now force-exits (130) instead of doing nothing
+  while a long paced pass finishes.
+- One-shot commands close the SQLite store on exit, so they no longer leave
+  `-wal`/`-shm` sidecar files lingering next to `tasks.db`.
+- Colour written to **stderr** (the status chatter from `watch`, `daemon` and
+  `research -w`) is now keyed to `process.stderr.isTTY`, not stdout's. Redirecting
+  one stream no longer strips colour from the other, nor leaks raw ANSI into a
+  redirected file.
+
+### Notes
+
+- The default `@google/genai` SDK transport is now covered by the offline suite
+  (previously every test forced `GEMCATCH_FORCE_REST=1`): a stubbed client drives
+  submit → poll → completed and one unwrapped SDK error, confirming `shape()`
+  reads an SDK-shaped response and `friendly()` surfaces Google's real message.
+- `GEMCATCH_RPM` pacing is **per process**. Two concurrent `gemcatch` processes
+  each keep their own counter and can together exceed the ceiling; run a single
+  daemon if the limit must hold. Documented in the README.
+
 ## [0.2.0] - 2026-07-19
 
 ### Added
@@ -96,7 +162,8 @@ seen a task complete, the text is cached locally and survives that expiry — bu
 something has to poll inside that window for it to be seen at all, which is what
 `gemcatch daemon` exists to do.
 
-[Unreleased]: https://github.com/Booyaka101/gemcatch/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Booyaka101/gemcatch/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Booyaka101/gemcatch/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Booyaka101/gemcatch/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Booyaka101/gemcatch/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Booyaka101/gemcatch/releases/tag/v0.1.0

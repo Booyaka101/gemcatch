@@ -125,7 +125,10 @@ function listTasks(opts) {
   let sql = 'SELECT * FROM tasks';
   if (where.length) sql += ` WHERE ${where.join(' AND ')}`;
   sql += ' ORDER BY created_at DESC';
-  if (o.limit) {
+  // Presence, not truthiness: `--limit 0` is a real cap (return nothing), so it
+  // must not be treated the same as "no limit given". The caller validates that
+  // it is a non-negative integer before we get here.
+  if (o.limit != null) {
     sql += ' LIMIT @limit';
     params.limit = o.limit;
   }
