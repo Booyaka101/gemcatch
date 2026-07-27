@@ -32,7 +32,21 @@ jobs:
         run: npx --yes npm-script-lens@latest audit --path .
 
       # Drift gate: fails if a dependency gains an install script that nobody has
-      # approved. The allowlist is only worth having if it is enforced.
+      # approved. The allowlist is only worth having if it is enforced — this
+      # step carried `continue-on-error: true`, which made it a report, not a
+      # gate, despite the name. Pinned rather than @latest for the same reason
+      # as the manifest step below: a gate that can fail must fail only on OUR
+      # changes, never on a detector release landing mid-week.
       - name: Allowlist drift
-        continue-on-error: true
-        run: npx --yes npm-script-lens@latest sync --path . --check
+        run: npx --yes npm-script-lens@1.4.0 sync --path . --check
+
+      # The allowlist records *which* packages may run scripts. This records
+      # what those scripts DO — so a package we already approved cannot quietly
+      # change its install-time behavior under the same version. That is the
+      # supply-chain shape an allowlist alone cannot see.
+      #
+      # Pinned, not @latest: the manifest carries the tool version that produced
+      # it, so a detector upgrade is itself drift. Bumping this pin is the
+      # deliberate moment to re-run `manifest --write` and read the diff.
+      - name: Install-behavior drift
+        run: npx --yes npm-script-lens@1.4.0 manifest --path . --check --no-trust

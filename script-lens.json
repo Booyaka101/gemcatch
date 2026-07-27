@@ -1,0 +1,13 @@
+{
+  "tool": "npm-script-lens",
+  "version": "1.4.0",
+  "packages": {
+    "better-sqlite3@12.11.1": {
+      "risk": "HIGH",
+      "capabilities": [
+        "exec",
+        "gyp"
+      ]
+    }
+  }
+}
