@@ -1,18 +1,33 @@
 version: 2
+
+# Staying current is a standing requirement, so it is automated rather than
+# remembered.
 updates:
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: 'chore(deps)'
     groups:
-      # One PR for routine bumps; @google/genai moves fast and is called out
-      # separately below since it's the only dep whose API we depend on deeply.
-      minor-and-patch:
-        update-types: [minor, patch]
-        exclude-patterns: ['@google/genai']
+      # Minor and patch only. Majors deliberately arrive as their own PR so one
+      # breaking upgrade cannot redden — and block — a batch of safe ones.
+      all-minor-patch:
+        patterns: ['*']
+        update-types: ['minor', 'patch']
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: monthly
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: 'chore(ci)'
+    groups:
+      # Minor and patch only. Majors deliberately arrive as their own PR so one
+      # breaking upgrade cannot redden — and block — a batch of safe ones.
+      actions-minor-patch:
+        patterns: ['*']
+        update-types: ['minor', 'patch']
+
