@@ -26,6 +26,11 @@ const MIGRATIONS = [
   ['error', 'TEXT'],
   ['usage', 'TEXT'],
   ['updated_at', 'INTEGER'],
+  // 0.4.0: agent runs. `agent` is the resolved agent id the task was submitted
+  // with (NULL for model runs, including every pre-0.4.0 row); `citations` is
+  // the JSON array of sources an agent run returned alongside its report.
+  ['agent', 'TEXT'],
+  ['citations', 'TEXT'],
 ];
 
 let _db = null;
@@ -59,8 +64,8 @@ function createTask(fields) {
   const now = Date.now();
   db()
     .prepare(
-      'INSERT INTO tasks (id, prompt, status, created_at, updated_at, model, system_instruction, tag) ' +
-        'VALUES (@id, @prompt, @status, @now, @now, @model, @system_instruction, @tag)'
+      'INSERT INTO tasks (id, prompt, status, created_at, updated_at, model, system_instruction, tag, agent) ' +
+        'VALUES (@id, @prompt, @status, @now, @now, @model, @system_instruction, @tag, @agent)'
     )
     .run({
       id,
@@ -70,6 +75,7 @@ function createTask(fields) {
       model: t.model || null,
       system_instruction: t.systemInstruction || null,
       tag: t.tag || null,
+      agent: t.agent || null,
     });
   return id;
 }
@@ -101,7 +107,7 @@ function setStatus(id, status, extra) {
   const e = extra || {};
   const sets = ['status = @status', 'updated_at = @now'];
   const params = { id, status, now: Date.now() };
-  for (const key of ['result', 'error', 'usage']) {
+  for (const key of ['result', 'error', 'usage', 'citations']) {
     if (e[key] !== undefined) {
       sets.push(`${key} = @${key}`);
       params[key] = e[key];
@@ -167,6 +173,14 @@ function counts() {
   return db().prepare('SELECT status, COUNT(*) AS n FROM tasks GROUP BY status').all();
 }
 
+// Per-agent totals for `stats`. Model runs (agent IS NULL) are not a row here;
+// they are already accounted for in counts().
+function agentCounts() {
+  return db()
+    .prepare('SELECT agent, COUNT(*) AS n FROM tasks WHERE agent IS NOT NULL GROUP BY agent')
+    .all();
+}
+
 function close() {
   if (_db) _db.close();
   _db = null;
@@ -185,5 +199,6 @@ module.exports = {
   removeMany,
   prunableTasks,
   counts,
+  agentCounts,
   close,
 };

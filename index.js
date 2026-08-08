@@ -89,6 +89,104 @@ function needTask(id) {
   return task;
 }
 
+// Citations ride along with an agent's report -- the docs tell users to review
+// them to verify the sources, so they are printed under the result rather than
+// left in the database. A run without citations prints exactly as before.
+function withSources(text, citations) {
+  const body = text || '(empty response)';
+  if (!Array.isArray(citations) || !citations.length) return body;
+  const lines = citations.map((c, i) => {
+    const title = (c && (c.title || c.text)) || '';
+    const url = (c && (c.url || c.uri)) || '';
+    return `  [${i + 1}] ${[title, url].filter(Boolean).join(' — ') || JSON.stringify(c)}`;
+  });
+  return `${body}\n\nSources:\n${lines.join('\n')}`;
+}
+
+// The citations column holds JSON (or NULL). Parsed defensively: a corrupt row
+// degrades to "no sources", never a crash in the middle of printing a result.
+function parseCitations(raw) {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) && v.length ? v : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// --- spend guard ----------------------------------------------------------
+
+// Deep Research agents are billed PER TASK, not per token -- the docs put
+// Deep Research at $1.00-$3.00 and Deep Research Max at $3.00-$7.00 -- and
+// gemcatch's whole ergonomic is firing a file of prompts at once, which turns
+// one careless `batch --agent` into a three-figure command. So no agent
+// submission happens without the cost being shown and confirmed: interactively
+// on a TTY, via --yes otherwise, and --dry-run previews without submitting.
+// The bands are quoted with the docs' own hedge ("estimates based on preview
+// rates and subject to change"), never as authoritative.
+
+function bandText(agentId, count) {
+  const band = gemini.AGENT_PRICE_BANDS[agentId];
+  if (!band) return 'no published price band for this agent';
+  const money = (n) => `$${(n * count).toFixed(2)}`;
+  return count > 1
+    ? `estimated ${money(band[0])}–${money(band[1])} total`
+    : `estimated ${money(band[0])}–${money(band[1])} for this task`;
+}
+
+function spendLine(agentId, count) {
+  const head = count > 1 ? `${count} prompts × ${agentId}` : `Agent ${agentId}`;
+  return `${head} — ${bandText(agentId, count)}`;
+}
+
+function askYesNo(question) {
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test((answer || '').trim()));
+    });
+  });
+}
+
+// Returns only when the submission is confirmed; otherwise it exits (declined)
+// or throws (no way to ask). Runs BEFORE any row is written, so a declined or
+// refused submission leaves the tasks table untouched.
+async function confirmSpend(agentId, count, opts) {
+  console.error(`${spendLine(agentId, count)} (preview rates, subject to change).`);
+  if (opts.yes) return;
+  // GEMCATCH_ASSUME_TTY lets the offline suite drive the interactive branch
+  // through a pipe; real non-TTY callers (cron, CI, scripts) must say --yes.
+  const interactive = process.stdin.isTTY || process.env.GEMCATCH_ASSUME_TTY === '1';
+  if (!interactive) {
+    throw new Error(
+      'stdin is not a TTY, so this agent submission cannot be confirmed interactively.\n' +
+        '  Pass --yes to confirm the cost above, or --dry-run to preview without submitting.'
+    );
+  }
+  if (!(await askYesNo('Submit? [y/N] '))) {
+    console.error('Nothing submitted.');
+    process.exit(1);
+  }
+}
+
+// Shared by research and batch: resolve the agent alias and reject the
+// ambiguous combination before anything is stored or sent. `--model` counts
+// only when the user actually typed it -- commander fills in the default
+// otherwise, and the default must not poison every agent run.
+function resolveAgentOpts(opts, cmd) {
+  if (!opts.agent) return null;
+  if (cmd.getOptionValueSource('model') === 'cli') {
+    throw new Error(
+      '--model and --agent are mutually exclusive: an agent run is submitted with `agent` ' +
+        'instead of `model`, and the agent picks its own models. Drop one of the two.'
+    );
+  }
+  return gemini.resolveAgent(opts.agent);
+}
+
 // --- input ----------------------------------------------------------------
 
 function readStdin() {
@@ -139,8 +237,12 @@ async function refresh(task) {
   }
   const extra = {};
   if (isDone(r.status)) {
-    if (isSuccess(r.status)) extra.result = r.text;
-    else if (r.text) extra.error = r.text;
+    if (isSuccess(r.status)) {
+      extra.result = r.text;
+      // Agent runs return citations with the report; the docs tell users to
+      // review them to verify the sources, so they are persisted, not dropped.
+      if (r.citations && r.citations.length) extra.citations = JSON.stringify(r.citations);
+    } else if (r.text) extra.error = r.text;
   }
   if (r.usage) extra.usage = JSON.stringify(r.usage);
   store.setStatus(task.id, r.status, extra);
@@ -177,22 +279,35 @@ program
   .argument('[prompt]', 'what you want researched; "-" reads stdin')
   .option('-f, --file <path>', 'read the prompt from a file')
   .option('-m, --model <id>', 'model to use', gemini.DEFAULT_MODEL)
+  .option('-a, --agent <id>', 'submit to a research agent instead of a model (e.g. deep-research)')
   .option('-s, --system <text>', 'system instruction')
   .option('-t, --tag <tag>', 'label for filtering with `gemcatch list --tag`')
   .option('-w, --watch', 'wait for the result instead of exiting')
+  .option('--yes', 'confirm the agent cost without asking (required when stdin is not a TTY)')
+  .option('--dry-run', 'show what would be submitted (and what it would cost); submit nothing')
   .option('--json', 'machine-readable output')
   .description('submit a background task and exit immediately')
-  .action(async (promptArg, opts) => {
+  .action(async (promptArg, opts, cmd) => {
     let id;
     try {
+      const agent = resolveAgentOpts(opts, cmd);
       const prompt = await resolvePrompt(promptArg, opts);
+      if (opts.dryRun) {
+        emit(opts.json, { dry_run: true, agent: agent || null, model: agent ? null : opts.model, prompt }, () => {
+          if (agent) console.log(`${spendLine(agent, 1)}. Nothing submitted (--dry-run).`);
+          else console.log(`Would submit to ${opts.model}: ${snippet(prompt)}. Nothing submitted (--dry-run).`);
+        });
+        return;
+      }
+      if (agent) await confirmSpend(agent, 1, opts);
       id = store.createTask({
         prompt,
-        model: opts.model,
+        model: agent ? null : opts.model,
+        agent,
         systemInstruction: opts.system,
         tag: opts.tag,
       });
-      const r = await gemini.submit(prompt, { model: opts.model, systemInstruction: opts.system });
+      const r = await gemini.submit(prompt, { model: opts.model, agent, systemInstruction: opts.system });
       store.setInteraction(id, r.interactionId, r.status);
       if (opts.watch) {
         // Under --watch the submit line is progress, not the answer, so it
@@ -296,15 +411,18 @@ program
   .command('batch')
   .argument('<file>', 'prompts file — one per line, or "-" to read stdin')
   .option('-m, --model <id>', 'model to use', gemini.DEFAULT_MODEL)
+  .option('-a, --agent <id>', 'submit every prompt to a research agent instead of a model')
   .option('-s, --system <text>', 'system instruction')
   .option('-t, --tag <tag>', 'tag the whole batch (default: batch-<hex>)')
   .option('--separator <str>', 'split the file on this delimiter line for multi-line prompts')
   .option('-w, --watch', 'submit all, then poll until the whole batch finishes')
+  .option('--yes', 'confirm the agent cost without asking (required when stdin is not a TTY)')
   .option('--dry-run', 'parse and list what would be submitted; submit nothing')
   .option('--json', 'machine-readable output')
   .description('submit many background tasks from a file, tagged as one batch')
-  .action(async (file, opts) => {
+  .action(async (file, opts, cmd) => {
     try {
+      const agent = resolveAgentOpts(opts, cmd);
       const text = file === '-' ? await readStdin() : fs.readFileSync(file, 'utf8');
       const { prompts, skipped } = parsePrompts(text, opts.separator);
       if (!prompts.length) throw new Error(`no prompts found in ${file === '-' ? 'stdin' : file}`);
@@ -317,19 +435,28 @@ program
       const tag = opts.tag || `batch-${crypto.randomUUID().slice(0, 6)}`;
 
       if (opts.dryRun) {
-        emit(opts.json, { tag, dry_run: true, prompts }, () => {
-          console.log(`Batch ${tag}: ${prompts.length} prompt(s) would be submitted:`);
-          for (const p of prompts) console.log(`  ${snippet(p)}`);
+        emit(opts.json, { tag, dry_run: true, agent: agent || null, prompts }, () => {
+          if (agent) {
+            // The whole point of the guard: N × the per-task band, up front.
+            console.log(`${spendLine(agent, prompts.length)}. Nothing submitted (--dry-run).`);
+          } else {
+            console.log(`Batch ${tag}: ${prompts.length} prompt(s) would be submitted:`);
+            for (const p of prompts) console.log(`  ${snippet(p)}`);
+          }
         });
         return;
       }
 
+      // An agent batch multiplies a per-task dollar band by the whole file, so
+      // it is confirmed as one total before a single row is written.
+      if (agent) await confirmSpend(agent, prompts.length, opts);
+
       // One failed submit must not sink the batch: mark that task failed and
       // keep going. mapLimit preserves input order, so the report is stable.
       const results = await mapLimit(prompts, 4, async (prompt) => {
-        const id = store.createTask({ prompt, model: opts.model, systemInstruction: opts.system, tag });
+        const id = store.createTask({ prompt, model: agent ? null : opts.model, agent, systemInstruction: opts.system, tag });
         try {
-          const r = await gemini.submit(prompt, { model: opts.model, systemInstruction: opts.system });
+          const r = await gemini.submit(prompt, { model: opts.model, agent, systemInstruction: opts.system });
           store.setInteraction(id, r.interactionId, r.status);
           return { id, interaction_id: r.interactionId, status: r.status, prompt };
         } catch (err) {
@@ -402,16 +529,17 @@ program
       // text stores `''`, which is exactly the case the cache must still serve
       // -- re-polling it would 404 after 24h, the very thing we cache to avoid.
       if (isSuccess(task.status) && task.result != null && !opts.raw) {
-        emit(opts.json, { id: task.id, status: task.status, result: task.result }, () =>
-          console.log(task.result || '(empty response)')
+        const cits = parseCitations(task.citations);
+        emit(opts.json, { id: task.id, status: task.status, result: task.result, citations: cits }, () =>
+          console.log(withSources(task.result, cits))
         );
         return;
       }
       const r = await refresh(task);
       if (opts.raw) return console.log(JSON.stringify(r.raw, null, 2));
       if (isSuccess(r.status)) {
-        emit(opts.json, { id: task.id, status: r.status, result: r.text }, () =>
-          console.log(r.text || '(empty response)')
+        emit(opts.json, { id: task.id, status: r.status, result: r.text, citations: r.citations || null }, () =>
+          console.log(withSources(r.text, r.citations))
         );
       } else if (isDone(r.status)) {
         emit(opts.json, { id: task.id, status: r.status, error: r.text || null }, () =>
@@ -450,14 +578,21 @@ program
       console.log('No tasks yet. Submit one:  gemcatch research "your question"');
       return;
     }
-    console.log(dim('ID        AGE   STATUS           PROMPT'));
+    // The AGENT column only appears when something in the listing used one, so
+    // a pure-model store keeps the compact four-column layout it always had.
+    // Agent ids are shown compact -- the "-preview-MM-YYYY" suffix is version
+    // noise in a table (the full id is in --json and in stats).
+    const showAgent = tasks.some((t) => t.agent);
+    const shortAgent = (a) => (a ? a.replace(/-preview-\d{2}-\d{4}$/, '') : '-');
+    console.log(dim(`ID        AGE   STATUS           ${showAgent ? 'AGENT              ' : ''}PROMPT`));
     for (const t of tasks) {
       const snip = snippet(t.prompt);
       const status = t.status || PENDING;
       // Pad before colouring: ANSI codes would break the column width.
       const pad = ' '.repeat(Math.max(0, 16 - status.length));
+      const agentCol = showAgent ? `${shortAgent(t.agent).padEnd(18)} ` : '';
       console.log(
-        `${t.id}  ${age(t.created_at).padEnd(4)}  ${colorStatus(status)}${pad} ${snip}`
+        `${t.id}  ${age(t.created_at).padEnd(4)}  ${colorStatus(status)}${pad} ${agentCol}${snip}`
       );
     }
   });
@@ -726,8 +861,8 @@ async function watchTask(task, intervalMs, json) {
       last = r.status;
     }
     if (isSuccess(r.status)) {
-      emit(json, { id: task.id, status: r.status, result: r.text }, () =>
-        console.log(r.text || '(empty response)')
+      emit(json, { id: task.id, status: r.status, result: r.text, citations: r.citations || null }, () =>
+        console.log(withSources(r.text, r.citations))
       );
       return;
     }
@@ -755,8 +890,9 @@ program
       // Serve a completed result from cache -- present, not merely truthy, so an
       // empty-text completion is served instead of re-polled (and lost at 24h).
       if (isSuccess(task.status) && task.result != null) {
-        emit(opts.json, { id: task.id, status: task.status, result: task.result }, () =>
-          console.log(task.result || '(empty response)')
+        const cits = parseCitations(task.citations);
+        emit(opts.json, { id: task.id, status: task.status, result: task.result, citations: cits }, () =>
+          console.log(withSources(task.result, cits))
         );
         return;
       }
@@ -850,11 +986,16 @@ program
   .description('where the store lives and what is in it')
   .action((opts) => {
     const rows = store.counts();
+    const agents = store.agentCounts();
     const total = rows.reduce((n, r) => n + r.n, 0);
-    emit(opts.json, { db: store.DB_PATH, total, by_status: rows }, () => {
+    emit(opts.json, { db: store.DB_PATH, total, by_status: rows, by_agent: agents }, () => {
       console.log(`Store: ${store.DB_PATH}`);
       console.log(`Tasks: ${total}`);
       for (const r of rows) console.log(`  ${colorStatus(r.status).padEnd(useColor ? 26 : 17)} ${r.n}`);
+      if (agents.length) {
+        console.log('Agent runs:');
+        for (const a of agents) console.log(`  ${a.agent.padEnd(34)} ${a.n}`);
+      }
     });
   });
 
