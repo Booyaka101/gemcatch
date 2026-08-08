@@ -23,7 +23,14 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
-      - run: npm ci
+      # --ignore-scripts: better-sqlite3 13.x dropped its `install` script and
+      # ships N-API prebuilds in the tarball (prebuilds/<platform>-<arch>.node),
+      # so nothing here needs building. Without this, npm sees the package's
+      # binding.gyp, falls back to `node-gyp rebuild`, and the build fails on
+      # windows-latest images carrying Visual Studio 18 -- node-gyp 11.5.0 (the
+      # one bundled with Node 22) reports it as "unknown version undefined" and
+      # gives up. Nothing in the dependency tree needs an install script to run.
+      - run: npm ci --ignore-scripts
 
       # The suite runs the real CLI against a mock Interactions API on
       # localhost. No GEMINI_API_KEY is needed, so this is safe on forks.
@@ -40,7 +47,7 @@ jobs:
           node-version: '22'
           cache: npm
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
 
       # Catches a broken bin entry or a missing file in `files` before a
       # release does.
