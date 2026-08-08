@@ -48,6 +48,9 @@ These are all load-bearing and were each learned the hard way:
 - **Every call goes through `call()`**, which paces it (`gate()`) and retries it. Add a new API operation and it must too, or it silently escapes both.
 - **Concurrency is not a rate.** `mapLimit` in `index.js` bounds how many polls are open at once; `GEMCATCH_RPM` in `gemini.js` is what actually keeps a wide fan-out inside the free tier's requests-per-minute allowance. They are different limits and both matter.
 - **Only transient failures retry.** 408/429/5xx and network errors, never 4xx: a bad key or bad model id fails the same way forever, so retrying it just spends the user's quota to reach the identical error. `shouldRetry()` is the one place that decides, and it's pinned by a test.
+- **`agent` replaces `model` on create — they are mutually exclusive.** An agent run is submitted with `agent` and no `model`; the CLI rejects the combination before anything is written. The full preview agent ids live in ONE table (`AGENT_ALIASES` in `gemini.js`) — never hardcode them at a call site, they will be superseded.
+- **An agent's report is in the FINAL step** (`steps[-1].content[0].text` per the docs); the earlier steps are its plan and interim drafts. `textFromSteps` takes the last answer-bearing step for every run — no special-casing on the agent id — and falls back to collecting everything if that step has no text.
+- **Agent submissions cost dollars per task, so the spend guard is load-bearing.** Any new path that reaches `gemini.submit` with an agent must go through `confirmSpend()` first, *before* any row is written — a declined confirmation must leave the store untouched. `GEMCATCH_ASSUME_TTY=1` is the test hook that lets the suite drive the interactive y/N branch through a pipe.
 
 ## Tests
 

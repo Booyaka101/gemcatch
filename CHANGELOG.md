@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-08
+
+### Added
+
+- **Research agents.** `-a, --agent <id>` on `research` and `batch` submits to a
+  Gemini Deep Research agent instead of a model — `interactions.create` is sent
+  `agent` *instead of* `model` (they are mutually exclusive, and passing both is
+  a clean error). Aliases resolve through one table: `deep-research` →
+  `deep-research-preview-04-2026`, `deep-research-max` →
+  `deep-research-max-preview-04-2026`; any other value passes through unchanged,
+  so a future agent id works without a gemcatch release. Agents *require*
+  background execution, which gemcatch has always set — and on the free tier the
+  finished report is dropped after 1 day, which is exactly the race the daemon
+  exists to win. The agent is recorded per task, shown in `list` (the AGENT
+  column appears when a listing contains agent runs) and tallied in `stats`.
+- **Spend guard.** Deep Research is documented at $1.00–$3.00 per task and Deep
+  Research Max at $3.00–$7.00 (estimates based on preview rates, per the docs,
+  and subject to change). Every agent submission prints its band first —
+  `batch` prints N × the band as a total — and asks for an interactive `y/N`
+  confirmation. When stdin is not a TTY, `--yes` is required and anything else
+  is refused before a row is written; declining writes nothing and exits
+  non-zero. `--dry-run` (now on `research` too) prints the full projected spend
+  and submits nothing.
+- **Citations.** Agent runs return citations alongside the report; the docs say
+  to review them to verify the sources, so they are persisted (new `citations`
+  column, JSON) rather than discarded, printed under the result as a `Sources:`
+  list, and carried in `--json` output.
+- Result extraction now takes the **final answer-bearing step** — where the
+  docs place an agent's completed report (`steps[-1].content[0].text`) and
+  where a model run's `model_output` already sits — with a fall-back to the old
+  collect-everything behaviour if that step carries no text, so an unexpected
+  shape can never silently blank a result. No special-casing on the agent id.
+- Additive schema migration: `agent` and `citations` columns. A pre-0.4.0
+  `tasks.db` upgrades in place, keeps every row, and reports `agent` as NULL
+  for them.
+
+### Changed
+
+- The default model is now **`gemini-3.5-flash-lite`** (GA on 2026-07-21),
+  replacing the older `gemini-3.1-flash-lite`. Override with `GEMCATCH_MODEL`
+  or `--model` as before.
+
 ## [0.3.0] - 2026-07-19
 
 ### Added
@@ -162,7 +204,8 @@ seen a task complete, the text is cached locally and survives that expiry — bu
 something has to poll inside that window for it to be seen at all, which is what
 `gemcatch daemon` exists to do.
 
-[Unreleased]: https://github.com/Booyaka101/gemcatch/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Booyaka101/gemcatch/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Booyaka101/gemcatch/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Booyaka101/gemcatch/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Booyaka101/gemcatch/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/Booyaka101/gemcatch/compare/v0.1.0...v0.1.1

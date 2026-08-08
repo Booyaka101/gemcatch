@@ -3,7 +3,41 @@
 const { isDone, isSuccess } = require('./status');
 
 // Free of charge on the Gemini free tier; override per-call with --model.
-const DEFAULT_MODEL = process.env.GEMCATCH_MODEL || 'gemini-3.1-flash-lite';
+// gemini-3.5-flash-lite went GA on 2026-07-21 (it replaced 3.1 as the
+// low-latency free-tier workhorse in the same release that deprecated the
+// sampling parameters).
+const DEFAULT_MODEL = process.env.GEMCATCH_MODEL || 'gemini-3.5-flash-lite';
+
+// --- agents ---------------------------------------------------------------
+
+// The Deep Research agents are reachable ONLY through the Interactions API,
+// and only with background execution -- which gemcatch always sets. An agent
+// is sent as `agent` on create, INSTEAD of `model`: the two are mutually
+// exclusive, and the CLI rejects the combination before anything is written.
+//
+// This table is the ONE place the full preview ids live. They are preview ids
+// and will be superseded; call sites must resolve through here (or pass an
+// unknown id straight through, so a future agent works without a release).
+const AGENT_ALIASES = Object.freeze({
+  'deep-research': 'deep-research-preview-04-2026',
+  'deep-research-max': 'deep-research-max-preview-04-2026',
+});
+
+// Documented per-task price bands, in dollars, keyed by the RESOLVED id.
+// The docs' own hedge applies -- "These figures are estimates based on
+// preview rates and are subject to change" -- so the spend guard quotes
+// them as estimates, never as authoritative.
+const AGENT_PRICE_BANDS = Object.freeze({
+  'deep-research-preview-04-2026': Object.freeze([1, 3]),
+  'deep-research-max-preview-04-2026': Object.freeze([3, 7]),
+});
+
+// A known alias resolves to its full preview id; anything else passes through
+// unchanged so a new or newer agent id works without a gemcatch release (a
+// genuinely bad id fails fast: the API 4xxes, and a 4xx never retries).
+function resolveAgent(id) {
+  return AGENT_ALIASES[id] || id;
+}
 
 // Overridable for tests and for routing via a proxy/gateway.
 const REST_BASE =
@@ -163,7 +197,11 @@ function collectText(node, acc) {
     return acc;
   }
   if (typeof node.text === 'string' && node.text.trim()) acc.push(node.text);
-  for (const v of Object.values(node)) {
+  for (const [k, v] of Object.entries(node)) {
+    // Citations are sources *about* the answer, not answer text: an agent step
+    // carries them alongside its content, and a citation's own title/snippet
+    // must not be concatenated into the result. They are collected separately.
+    if (k === 'citations') continue;
     if (v && typeof v === 'object') collectText(v, acc);
   }
   return acc;
@@ -173,19 +211,63 @@ function collectText(node, acc) {
 // internal reasoning with the actual answer, each tagged by `type`:
 //   [ {type:'user_input', ...}, {type:'thought', ...}, {type:'model_output', ...} ]
 // Collecting text indiscriminately prepends the prompt (and any reasoning) to
-// the result, so those step types are skipped. Anything else -- model_output,
-// an untyped step, a future answer-bearing type -- still contributes, so a
-// renamed step never silently blanks the result.
+// the result, so those step types are skipped.
+//
+// Both kinds of run put the deliverable in the FINAL answer-bearing step. A
+// model run ends [user_input, thought, model_output]; an agent run's steps
+// additionally interleave its plan, searches and interim drafts, and the docs
+// place the finished report at `interaction.steps[-1].content[0].text`. So one
+// rule serves both, with no special-casing on the agent id: take the last step
+// that is not user_input/thought. If that step somehow carries no text -- an
+// unexpected shape, a renamed type -- fall back to collecting across every
+// answer-bearing step, so the failure mode is "too much text", never a
+// silently blank result.
 const NON_ANSWER_STEP = new Set(['user_input', 'thought']);
 
 function textFromSteps(steps) {
   if (!Array.isArray(steps)) return '';
+  const candidates = steps.filter((s) => !(s && NON_ANSWER_STEP.has(s.type)));
+  if (!candidates.length) return '';
+  const last = collectText(candidates[candidates.length - 1], []).join('\n').trim();
+  if (last) return last;
   const acc = [];
-  for (const step of steps) {
-    if (step && NON_ANSWER_STEP.has(step.type)) continue;
-    collectText(step, acc);
-  }
+  for (const step of candidates) collectText(step, acc);
   return acc.join('\n').trim();
+}
+
+// Agent runs carry citations -- the docs explicitly tell users to review them
+// to verify the sources -- so they are gathered rather than discarded. The
+// walk is shape-agnostic (any `citations` array anywhere in the interaction),
+// because the docs do not pin down where they attach; duplicates are dropped.
+function collectCitations(node, acc) {
+  if (!node || typeof node !== 'object') return acc;
+  if (Array.isArray(node)) {
+    for (const n of node) collectCitations(n, acc);
+    return acc;
+  }
+  for (const [k, v] of Object.entries(node)) {
+    if (k === 'citations' && Array.isArray(v)) {
+      for (const c of v) if (c && typeof c === 'object') acc.push(c);
+      continue;
+    }
+    if (v && typeof v === 'object') collectCitations(v, acc);
+  }
+  return acc;
+}
+
+function citationsOf(interaction) {
+  const all = collectCitations(interaction, []);
+  if (!all.length) return null;
+  const seen = new Set();
+  const out = [];
+  for (const c of all) {
+    const key = JSON.stringify(c);
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(c);
+    }
+  }
+  return out;
 }
 
 function textOf(interaction) {
@@ -200,6 +282,7 @@ function shape(r) {
     interactionId: r.id,
     status: r.status,
     text: textOf(r),
+    citations: citationsOf(r),
     usage: r.usage || null,
     raw: r,
   };
@@ -269,7 +352,13 @@ function restHeaders() {
 
 async function submit(prompt, opts) {
   const o = opts || {};
-  const body = { model: o.model || DEFAULT_MODEL, input: prompt, background: true };
+  // `agent` and `model` are mutually exclusive on create: an agent run is sent
+  // with `agent` INSTEAD of `model` (the agent picks its own models). `input`
+  // stays a plain string and `background` stays true either way -- agents
+  // *require* background execution, which gemcatch has always set.
+  const body = o.agent
+    ? { agent: o.agent, input: prompt, background: true }
+    : { model: o.model || DEFAULT_MODEL, input: prompt, background: true };
   if (o.systemInstruction) body.system_instruction = o.systemInstruction;
   const r = await call(() => {
     const api = sdkInteractions();
@@ -323,6 +412,9 @@ module.exports = {
   REST_BASE,
   RPM,
   MAX_RETRIES,
+  AGENT_ALIASES,
+  AGENT_PRICE_BANDS,
+  resolveAgent,
   submit,
   poll,
   cancel,
@@ -330,6 +422,7 @@ module.exports = {
   apiKey,
   textOf,
   collectText,
+  citationsOf,
   // Exported for the suite: the retry policy is behaviour worth pinning.
   shouldRetry,
   // Re-exported so callers need only one require.

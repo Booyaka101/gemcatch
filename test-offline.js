@@ -21,13 +21,26 @@ const { spawn } = require('child_process');
 const Database = require('better-sqlite3');
 
 const ANSWER = 'This week in AI: the Interactions API shipped background execution.';
+// An agent's report lives in the FINAL step; the interim steps hold the plan
+// and drafts and must never leak into the result.
+const AGENT_ANSWER =
+  'Deep Research report: the EU AI Act phases in high-risk obligations from August 2026, ' +
+  'while the UK relies on regulator-led guidance.';
+const AGENT_CITATIONS = [
+  { title: 'EU AI Act — EUR-Lex', url: 'https://eur-lex.europa.eu/eli/reg/2024/1689' },
+  { title: 'UK AI regulation white paper', url: 'https://www.gov.uk/ai-regulation-pro-innovation' },
+];
+// The mock accepts exactly the documented preview ids; anything else 4xxes,
+// like the real API would for a bad agent id.
+const KNOWN_AGENTS = new Set(['deep-research-preview-04-2026', 'deep-research-max-preview-04-2026']);
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'gemcatch-test-'));
 
 let seq = 0;
 let getHits = 0;
 let keyRejects = 0;
 let flaky503s = 0;
-const interactions = new Map(); // id -> {status, pollsLeft, text, model, system, deleted}
+let agentRejects = 0;
+const interactions = new Map(); // id -> {status, pollsLeft, text, model, system, agent, deleted}
 
 // --- mock Interactions API ------------------------------------------------
 
@@ -52,6 +65,15 @@ const server = http.createServer((req, res) => {
       const body = JSON.parse(raw);
       assert.strictEqual(body.background, true, 'background must be true');
       assert.strictEqual(typeof body.input, 'string', 'input must be a plain string');
+      // `agent` replaces `model` on create; the two are mutually exclusive and
+      // exactly one must be present. The CLI enforces this before submitting,
+      // so the mock asserting it catches any regression that slips one through.
+      assert(!(body.agent && body.model), 'agent and model are mutually exclusive');
+      assert(body.agent || body.model, 'one of agent or model is required');
+      if (body.agent && !KNOWN_AGENTS.has(body.agent)) {
+        agentRejects += 1;
+        return send(400, { error: { code: 400, message: `Unknown agent id: ${body.agent}.` } });
+      }
       const id = `int_${++seq}`;
       interactions.set(id, {
         status: 'in_progress',
@@ -69,6 +91,10 @@ const server = http.createServer((req, res) => {
         // drive the watch/daemon consecutive-failure safety bound.
         hardFailLeft: /HARDFAIL/.test(body.input) ? Infinity : /WATCHWEDGE/.test(body.input) ? 4 : 0,
         model: body.model,
+        agent: body.agent,
+        // BUDGETPAUSE mimics a max_total_tokens cap being hit: the agent run
+        // "safely pauses" and the interaction comes back status: incomplete.
+        budgetPause: /BUDGETPAUSE/.test(body.input),
         system: body.system_instruction,
       });
       send(200, { id, status: 'in_progress' });
@@ -119,6 +145,37 @@ const server = http.createServer((req, res) => {
     }
     if (it.status === 'cancelled') return send(200, { id: idPart, status: 'cancelled' });
     if (it.fails) return send(200, { id: idPart, status: 'failed', usage: { total_tokens: 3 } });
+    if (it.agent) {
+      // A max_total_tokens budget pause: the run stops part-way and the
+      // interaction returns status incomplete -- terminal, with no report.
+      if (it.budgetPause) {
+        return send(200, {
+          id: idPart,
+          agent: it.agent,
+          status: 'incomplete',
+          usage: { total_tokens: 500 },
+          steps: [
+            { type: 'user_input', content: [{ type: 'text', text: it.prompt }] },
+            { type: 'thought', signature: 'redacted' },
+          ],
+        });
+      }
+      // An agent run is multi-step: plan and interim drafts first, the actual
+      // report in the FINAL step (docs: interaction.steps[-1].content[0].text),
+      // with citations attached. Only that final step's text is the answer.
+      return send(200, {
+        id: idPart,
+        agent: it.agent,
+        status: 'completed',
+        usage: { total_tokens: 1234 },
+        steps: [
+          { type: 'user_input', content: [{ type: 'text', text: it.prompt }] },
+          { type: 'thought', signature: 'redacted' },
+          { type: 'model_output', content: [{ type: 'text', text: 'Interim: research plan drafted, 12 sources fetched.' }] },
+          { type: 'model_output', content: [{ type: 'text', text: AGENT_ANSWER }], citations: AGENT_CITATIONS },
+        ],
+      });
+    }
     // No output_text on REST: text must be recovered from steps. The real API
     // interleaves the echoed prompt and the model's reasoning with the answer,
     // so the mock does too -- only the model_output text may come back.
@@ -209,6 +266,31 @@ function cliTimeout(args, extra, ms) {
 }
 
 const out = async (args, extra) => (await cli(args, extra)).stdout;
+
+// Open-query-close helpers: on Windows a leaked better-sqlite3 handle keeps
+// tasks.db locked and the suite's final rmSync dies with EBUSY.
+function qget(home, sql, ...params) {
+  const d = new Database(path.join(home, 'tasks.db'), { readonly: true });
+  try {
+    return d.prepare(sql).get(...params);
+  } finally {
+    d.close();
+  }
+}
+function qall(home, sql, ...params) {
+  const d = new Database(path.join(home, 'tasks.db'), { readonly: true });
+  try {
+    return d.prepare(sql).all(...params);
+  } finally {
+    d.close();
+  }
+}
+// Row count that treats "no db yet" as zero -- a refused submission may exit
+// before the store is even created, and both outcomes are "nothing written".
+function taskCount(home) {
+  if (!fs.existsSync(path.join(home, 'tasks.db'))) return 0;
+  return qget(home, 'SELECT COUNT(*) AS n FROM tasks').n;
+}
 const idOf = (text) => (text.match(/^Task (\w+) submitted\./m) || [])[1];
 const ok = (name) => console.log(`  ok  ${name}`);
 
@@ -244,6 +326,35 @@ async function submit(prompt, args, extra) {
   );
   ok('textOf prefers output_text, falls back to steps');
 
+  // Agent runs: the report is the FINAL answer-bearing step; the interim
+  // drafts must not be concatenated in, and citations are metadata, never text.
+  const agentShaped = {
+    agent: 'deep-research-preview-04-2026',
+    steps: [
+      { type: 'user_input', content: [{ type: 'text', text: 'the prompt' }] },
+      { type: 'thought', signature: 'redacted' },
+      { type: 'model_output', content: [{ type: 'text', text: 'interim draft' }] },
+      {
+        type: 'model_output',
+        content: [{ type: 'text', text: 'the final report' }],
+        citations: [{ title: 'A Source', url: 'https://example.com/a' }],
+      },
+    ],
+  };
+  assert.strictEqual(gemini.textOf(agentShaped), 'the final report');
+  assert.deepStrictEqual(gemini.citationsOf(agentShaped), [{ title: 'A Source', url: 'https://example.com/a' }]);
+  assert.strictEqual(gemini.citationsOf({ steps: [] }), null, 'a model run has no citations');
+  ok('textOf takes the final step of an agent run; citationsOf gathers sources, textOf excludes them');
+
+  // ONE alias table: known aliases resolve to the full preview ids, anything
+  // else passes through untouched so future agent ids need no gemcatch release.
+  assert.strictEqual(gemini.resolveAgent('deep-research'), 'deep-research-preview-04-2026');
+  assert.strictEqual(gemini.resolveAgent('deep-research-max'), 'deep-research-max-preview-04-2026');
+  assert.strictEqual(gemini.resolveAgent('some-future-agent-01-2027'), 'some-future-agent-01-2027');
+  assert(gemini.AGENT_PRICE_BANDS['deep-research-preview-04-2026'], 'the standard band exists');
+  assert(gemini.AGENT_PRICE_BANDS['deep-research-max-preview-04-2026'], 'the max band exists');
+  ok('resolveAgent maps aliases through one table and passes unknown ids through');
+
   // A 4xx is a bad request and will fail identically forever; retrying it just
   // wastes the user's rate limit. Everything transient gets another go.
   for (const s of [408, 429, 500, 502, 503, 504]) {
@@ -276,10 +387,32 @@ async function submit(prompt, args, extra) {
   const migrated = (await out(['list'], { env: { GEMCATCH_HOME: legacy } }));
   assert(migrated.includes('old00001'), `legacy row should survive migration: ${migrated}`);
   const cols = new Database(path.join(legacy, 'tasks.db')).prepare('PRAGMA table_info(tasks)').all().map((c) => c.name);
-  for (const c of ['model', 'tag', 'usage', 'updated_at', 'error', 'system_instruction']) {
+  for (const c of ['model', 'tag', 'usage', 'updated_at', 'error', 'system_instruction', 'agent', 'citations']) {
     assert(cols.includes(c), `migration should add ${c}`);
   }
   ok('a v1 tasks.db migrates in place without losing rows');
+
+  // ---- v0.3.0 -> 0.4.0 migration ----
+  // A store written by 0.3.0 (all pre-agent columns, no agent/citations) must
+  // upgrade in place: every row preserved, agent reported as NULL for them.
+  const v030 = path.join(HOME, 'v030');
+  fs.mkdirSync(v030, { recursive: true });
+  const v030Db = new Database(path.join(v030, 'tasks.db'));
+  v030Db.exec(
+    "CREATE TABLE tasks (id TEXT PRIMARY KEY, prompt TEXT, interaction_id TEXT, status TEXT DEFAULT 'pending', " +
+      'result TEXT, created_at INTEGER, model TEXT, system_instruction TEXT, tag TEXT, error TEXT, usage TEXT, updated_at INTEGER)'
+  );
+  const insV030 = v030Db.prepare(
+    'INSERT INTO tasks (id, prompt, status, result, created_at, model) VALUES (?,?,?,?,?,?)'
+  );
+  insV030.run('pre04001', 'a 0.3.0 row', 'completed', 'old answer', 100, 'gemini-3.1-flash-lite');
+  insV030.run('pre04002', 'another 0.3.0 row', 'in_progress', null, 200, 'gemini-3.1-flash-lite');
+  v030Db.close();
+  const v030Rows = JSON.parse(await out(['list', '--json'], { env: { GEMCATCH_HOME: v030 } }));
+  assert.strictEqual(v030Rows.length, 2, 'every 0.3.0 row survives the 0.4.0 migration');
+  for (const r of v030Rows) assert.strictEqual(r.agent, null, `a pre-agent row reports agent as NULL: ${JSON.stringify(r)}`);
+  assert.strictEqual(v030Rows.find((r) => r.id === 'pre04001').result, 'old answer', 'results are untouched');
+  ok('a v0.3.0 tasks.db migrates to 0.4.0 preserving every row, agent NULL for all of them');
 
   // ---- research ----
   const t0 = Date.now();
@@ -301,8 +434,8 @@ async function submit(prompt, args, extra) {
 
   // ---- default model ----
   const dflt = JSON.parse(await out(['research', 'default model', '--json']));
-  assert.strictEqual(interactions.get(dflt.interaction_id).model, 'gemini-3.1-flash-lite', 'default model');
-  ok('default model is gemini-3.1-flash-lite');
+  assert.strictEqual(interactions.get(dflt.interaction_id).model, 'gemini-3.5-flash-lite', 'default model');
+  ok('default model is gemini-3.5-flash-lite (GA since 2026-07-21)');
 
   // ---- stdin + --file ----
   const viaStdin = idOf(await out(['research', '-'], { stdin: 'prompt from stdin' }));
@@ -713,6 +846,157 @@ async function submit(prompt, args, extra) {
   );
   ok('digest feeds a tag\'s completed results through one Gemini call into a single summary');
 
+  // ========================================================================
+  // Research agents (0.4.0)
+  // ========================================================================
+
+  // ---- research --agent: alias resolves, agent (not model) reaches the API,
+  // the row records the full preview id, and the report comes from the final
+  // step with its citations persisted. ----
+  const agEnv = { GEMCATCH_HOME: path.join(HOME, 'agent') };
+  const agRun = await cli(['research', 'map the EU AI Act against the UK approach', '--agent', 'deep-research', '--yes'], { env: agEnv });
+  const agId = idOf(agRun.stdout);
+  assert(agId, `agent research should submit: ${agRun.stdout}`);
+  assert(
+    /Agent deep-research-preview-04-2026 — estimated \$1\.00–\$3\.00 for this task \(preview rates, subject to change\)\./.test(agRun.stderr),
+    `the spend band must be shown even under --yes: ${agRun.stderr}`
+  );
+  const agRow = qget(agEnv.GEMCATCH_HOME, 'SELECT agent, model, interaction_id FROM tasks WHERE id = ?', agId);
+  assert.strictEqual(agRow.agent, 'deep-research-preview-04-2026', 'the row stores the RESOLVED agent id');
+  assert.strictEqual(agRow.model, null, 'an agent run stores no model');
+  assert.strictEqual(interactions.get(agRow.interaction_id).agent, 'deep-research-preview-04-2026', 'the API got `agent`');
+  assert.strictEqual(interactions.get(agRow.interaction_id).model, undefined, 'the API must NOT get `model`');
+  await out(['get', agId], { env: agEnv }); // first poll: still in_progress
+  const agGet = await out(['get', agId], { env: agEnv });
+  assert(agGet.includes(AGENT_ANSWER), `get should print the final-step report: ${agGet}`);
+  assert(!agGet.includes('Interim'), 'interim agent steps must not leak into the result');
+  assert(agGet.includes('Sources:'), 'an agent result lists its sources');
+  for (const c of AGENT_CITATIONS) assert(agGet.includes(c.url), `each citation url is printed: ${c.url}`);
+  const agCits = qget(agEnv.GEMCATCH_HOME, 'SELECT citations FROM tasks WHERE id = ?', agId);
+  assert.deepStrictEqual(JSON.parse(agCits.citations), AGENT_CITATIONS, 'citations are persisted as JSON');
+  const agJson = JSON.parse(await out(['get', agId, '--json'], { env: agEnv }));
+  assert.deepStrictEqual(agJson.citations, AGENT_CITATIONS, 'get --json carries the citations from cache');
+  ok('research --agent resolves the alias, sends agent instead of model, takes the final step, keeps citations');
+
+  // ---- list shows the agent; stats counts agent runs ----
+  const agList = await out(['list'], { env: agEnv });
+  assert(/AGENT/.test(agList), `list grows an AGENT column when an agent run exists: ${agList}`);
+  assert(/deep-research/.test(agList), 'the agent is shown against its task');
+  const agStats = JSON.parse(await out(['stats', '--json'], { env: agEnv }));
+  assert.deepStrictEqual(agStats.by_agent, [{ agent: 'deep-research-preview-04-2026', n: 1 }], 'stats counts per agent');
+  const agStatsHuman = await out(['stats'], { env: agEnv });
+  assert(/Agent runs:/.test(agStatsHuman) && /deep-research-preview-04-2026/.test(agStatsHuman), `stats names the agent: ${agStatsHuman}`);
+  ok('list shows an AGENT column and stats tallies agent runs');
+
+  // ---- --model and --agent together: clean error, nothing submitted ----
+  const mxEnv = { GEMCATCH_HOME: path.join(HOME, 'mutex') };
+  const mx = await cli(['research', 'x', '--agent', 'deep-research', '--model', 'gemini-3.6-flash', '--yes'], { env: mxEnv }).catch((e) => e);
+  assert.strictEqual(mx.code, 1, '--model + --agent must be rejected');
+  assert(/--model and --agent are mutually exclusive/.test(mx.stderr), `expected the mutual-exclusion message: ${mx.stderr}`);
+  const mxB = await cli(['batch', '-', '--agent', 'deep-research', '--model', 'gemini-3.6-flash', '--yes'], { env: mxEnv, stdin: 'q one\n' }).catch((e) => e);
+  assert.strictEqual(mxB.code, 1, 'batch rejects the combination too');
+  assert(/mutually exclusive/.test(mxB.stderr), `batch should explain: ${mxB.stderr}`);
+  assert.strictEqual(taskCount(mxEnv.GEMCATCH_HOME), 0, 'a rejected flag combination writes no rows');
+  ok('--model with --agent is a clean error and nothing is submitted');
+
+  // ---- unknown raw agent id: passed through, the 4xx surfaces immediately ----
+  const unEnv = { GEMCATCH_HOME: path.join(HOME, 'unknown-agent') };
+  const beforeAgentRejects = agentRejects;
+  const un = await cli(['research', 'probe', '--agent', 'brand-new-agent-01-2027', '--yes'], { env: unEnv }).catch((e) => e);
+  assert.strictEqual(un.code, 1, 'an unknown agent id fails');
+  assert(/Unknown agent id: brand-new-agent-01-2027/.test(un.stderr), `the API's own 4xx message surfaces: ${un.stderr}`);
+  assert(/no published price band/.test(un.stderr), 'the guard is honest when it has no band for an id');
+  assert.strictEqual(agentRejects - beforeAgentRejects, 1, 'a 4xx on submit is not retried');
+  const unRow = qget(unEnv.GEMCATCH_HOME, 'SELECT status FROM tasks');
+  assert.strictEqual(unRow.status, 'failed', 'the failed submit is recorded');
+  ok('an unknown raw agent id passes through and the API 4xx surfaces immediately, unretried');
+
+  // ---- spend guard: declined -> zero rows, non-zero exit ----
+  const dcEnv = { GEMCATCH_HOME: path.join(HOME, 'declined') };
+  const dc = await cli(['research', 'expensive question', '--agent', 'deep-research-max'],
+    { env: Object.assign({}, dcEnv, { GEMCATCH_ASSUME_TTY: '1' }), stdin: 'n\n' }).catch((e) => e);
+  assert.strictEqual(dc.code, 1, 'declining the confirmation exits non-zero');
+  assert(/\$3\.00–\$7\.00/.test(dc.stderr), `the max band is quoted before asking: ${dc.stderr}`);
+  assert(/Nothing submitted/.test(dc.stderr), `declining says so: ${dc.stderr}`);
+  assert.strictEqual(taskCount(dcEnv.GEMCATCH_HOME), 0, 'declining must leave the tasks table untouched');
+  ok('declining the confirmation writes zero rows and exits non-zero');
+
+  // ---- spend guard: an interactive "y" submits ----
+  const ycEnv = { GEMCATCH_HOME: path.join(HOME, 'confirmed') };
+  const yc = await cli(['research', 'go ahead', '--agent', 'deep-research'],
+    { env: Object.assign({}, ycEnv, { GEMCATCH_ASSUME_TTY: '1' }), stdin: 'y\n' });
+  assert(idOf(yc.stdout), `answering y submits: ${yc.stdout}`);
+  assert(/Submit\? \[y\/N\]/.test(yc.stderr), `the y/N question is asked on stderr: ${yc.stderr}`);
+  ok('answering y to the confirmation submits the task');
+
+  // ---- spend guard: non-TTY without --yes is refused ----
+  const ntEnv = { GEMCATCH_HOME: path.join(HOME, 'notty') };
+  const nt = await cli(['research', 'scripted', '--agent', 'deep-research'], { env: ntEnv }).catch((e) => e);
+  assert.strictEqual(nt.code, 1, 'non-TTY without --yes must refuse');
+  assert(/stdin is not a TTY/.test(nt.stderr) && /--yes/.test(nt.stderr), `the refusal names the fix: ${nt.stderr}`);
+  assert.strictEqual(taskCount(ntEnv.GEMCATCH_HOME), 0, 'a refused submission writes no rows');
+  ok('non-TTY without --yes is refused before anything is written');
+
+  // ---- research --agent --dry-run: band printed, nothing submitted ----
+  const rdEnv = { GEMCATCH_HOME: path.join(HOME, 'research-dry') };
+  const rd = await out(['research', 'preview only', '--agent', 'deep-research', '--dry-run'], { env: rdEnv });
+  assert(
+    /Agent deep-research-preview-04-2026 — estimated \$1\.00–\$3\.00 for this task\. Nothing submitted \(--dry-run\)\./.test(rd),
+    `dry-run prints the projected spend: ${rd}`
+  );
+  assert.strictEqual(taskCount(rdEnv.GEMCATCH_HOME), 0, 'research --dry-run submits nothing');
+  ok('research --agent --dry-run prints the band and submits nothing');
+
+  // ---- batch --agent --dry-run: N × band total, nothing submitted ----
+  const bdEnv = { GEMCATCH_HOME: path.join(HOME, 'batch-dry-agent') };
+  const bdFile = path.join(HOME, 'agent-batch.txt');
+  fs.writeFileSync(bdFile, 'q one\nq two\nq three\n');
+  const bd = await out(['batch', bdFile, '--agent', 'deep-research-max', '--dry-run'], { env: bdEnv });
+  assert(
+    /3 prompts × deep-research-max-preview-04-2026 — estimated \$9\.00–\$21\.00 total\. Nothing submitted \(--dry-run\)\./.test(bd),
+    `batch dry-run multiplies the band by N: ${bd}`
+  );
+  assert.strictEqual(taskCount(bdEnv.GEMCATCH_HOME), 0, 'batch --dry-run submits nothing');
+  ok('batch --agent --dry-run prints the N × band total and submits nothing');
+
+  // ---- batch --agent --yes: every row carries the resolved agent ----
+  const baEnv = { GEMCATCH_HOME: path.join(HOME, 'batch-agent') };
+  const ba = await cli(['batch', bdFile, '--agent', 'deep-research', '--yes', '--json', '-t', 'agents'], { env: baEnv });
+  assert(/3 prompts × deep-research-preview-04-2026 — estimated \$3\.00–\$9\.00 total/.test(ba.stderr),
+    `the batch guard quotes N × band on stderr: ${ba.stderr}`);
+  const baJson = JSON.parse(ba.stdout);
+  assert.strictEqual(baJson.submitted.length, 3, 'all three submitted');
+  const baRows = qall(baEnv.GEMCATCH_HOME, 'SELECT agent, model FROM tasks');
+  for (const r of baRows) {
+    assert.strictEqual(r.agent, 'deep-research-preview-04-2026', 'each batch row stores the resolved agent');
+    assert.strictEqual(r.model, null, 'no model on agent rows');
+  }
+  ok('batch --agent --yes submits the file with the resolved agent on every row');
+
+  // ---- an agent run that hits its budget: status incomplete is terminal, the
+  // daemon retires it and converges instead of spinning. ----
+  const bpEnv = { GEMCATCH_HOME: path.join(HOME, 'budget-pause') };
+  const bpRun = await cli(['research', 'BUDGETPAUSE giant question', '--agent', 'deep-research', '--yes'], { env: bpEnv });
+  const bpId = idOf(bpRun.stdout);
+  const bpDaemon = await cliTimeout(['daemon', '-i', '0.05', '--exit-when-idle', '--json'], { env: bpEnv }, 15000);
+  assert.strictEqual(bpDaemon.timedOut, false, 'the daemon must converge on an incomplete agent run, not spin');
+  const bpRow = qget(bpEnv.GEMCATCH_HOME, 'SELECT status FROM tasks WHERE id = ?', bpId);
+  assert.strictEqual(bpRow.status, 'incomplete', `a budget pause retires the task as incomplete: ${JSON.stringify(bpRow)}`);
+  ok('an agent run paused by its token budget (status incomplete) retires cleanly; the daemon converges');
+
+  // ---- an agent interaction 404ing after the free tier's 1-day retention
+  // takes the existing retire-to-incomplete path unchanged. ----
+  const axEnv = { GEMCATCH_HOME: path.join(HOME, 'agent-expire') };
+  const axRun = await cli(['research', 'SLOW agent expiry', '--agent', 'deep-research', '--yes'], { env: axEnv });
+  const axId = idOf(axRun.stdout);
+  const axIid = qget(axEnv.GEMCATCH_HOME, 'SELECT interaction_id FROM tasks WHERE id = ?', axId).interaction_id;
+  interactions.delete(axIid);
+  const axDaemon = await cliTimeout(['daemon', '-i', '0.05', '--exit-when-idle', '--json'], { env: axEnv }, 15000);
+  assert.strictEqual(axDaemon.timedOut, false, 'the daemon converges once the 404 retires the agent task');
+  const axRow = qget(axEnv.GEMCATCH_HOME, 'SELECT status FROM tasks WHERE id = ?', axId);
+  assert.strictEqual(axRow.status, 'incomplete', 'an expired agent interaction retires to incomplete');
+  ok('an expired (404) agent interaction retires to incomplete exactly like a model one');
+
   // ---- #3: the default SDK transport, exercised against a stubbed @google/genai.
   // Every test above forces GEMCATCH_FORCE_REST=1, so sdkInteractions() is
   // otherwise never covered. Inject a stub client and drive it directly. ----
@@ -728,8 +1012,10 @@ async function submit(prompt, args, extra) {
           create: async (body) => {
             assert.strictEqual(body.background, true, 'SDK submit must pass background:true');
             assert.strictEqual(typeof body.input, 'string', 'SDK input must be a plain string');
+            assert(!(body.agent && body.model), 'SDK submit must never send agent AND model');
+            assert(body.agent || body.model, 'SDK submit must send one of agent or model');
             const id = `sdk_${++sdkSeq}`;
-            sdkState.set(id, { polls: /SLOW/.test(body.input) ? 1 : 0, boom: /BOOM/.test(body.input) });
+            sdkState.set(id, { polls: /SLOW/.test(body.input) ? 1 : 0, boom: /BOOM/.test(body.input), agent: body.agent });
             return { id, status: 'in_progress' };
           },
           get: async (id) => {
@@ -746,6 +1032,21 @@ async function submit(prompt, args, extra) {
             if (s.polls > 0) {
               s.polls -= 1;
               return { id, status: 'in_progress' };
+            }
+            // An agent run through the SDK: multi-step, report last, citations
+            // attached -- shape() must read it the same way it reads REST.
+            if (s.agent) {
+              return {
+                id,
+                agent: s.agent,
+                status: 'completed',
+                usage: { total_tokens: 900 },
+                steps: [
+                  { type: 'user_input', content: [{ type: 'text', text: 'the question' }] },
+                  { type: 'model_output', content: [{ type: 'text', text: 'interim notes' }] },
+                  { type: 'model_output', content: [{ type: 'text', text: AGENT_ANSWER }], citations: AGENT_CITATIONS },
+                ],
+              };
             }
             // The SDK synthesises output_text; return one so shape() prefers it.
             return { id, status: 'completed', output_text: ANSWER, usage: { total_tokens: 7 } };
@@ -778,6 +1079,14 @@ async function submit(prompt, args, extra) {
     const boom = await sdk.submit('BOOM').then((r) => sdk.poll(r.interactionId)).catch((e) => e);
     assert(/Unknown model id via SDK/.test(boom.message), `friendly() must surface the SDK's real payload: ${boom.message}`);
     assert.strictEqual(boom.httpStatus, 400, 'friendly() maps the SDK error to its HTTP status');
+
+    // The agent path through the SDK: `agent` on create, no `model`, and the
+    // final-step report with citations coming back through shape().
+    const sa = await sdk.submit('deep dive', { agent: 'deep-research-preview-04-2026' });
+    const sp = await sdk.poll(sa.interactionId);
+    assert.strictEqual(sp.status, 'completed');
+    assert.strictEqual(sp.text, AGENT_ANSWER, 'the SDK agent run yields only the final-step report');
+    assert.deepStrictEqual(sp.citations, AGENT_CITATIONS, 'citations survive the SDK path');
 
     // Restore: nothing after this should see the stub or the fake key.
     delete require.cache[geminiPath];

@@ -24,7 +24,7 @@ The EU AI Act's high-risk obligations phase in from August 2026, whereas...
 
 ## Setup
 
-Needs Node.js 22+ and a Gemini API key. **Getting a key needs no billing account and no card.** `gemini-3.1-flash-lite` runs free within the [free tier's](https://ai.google.dev/gemini-api/docs/pricing) daily quota; past that, paid rates apply.
+Needs Node.js 22+ and a Gemini API key. **Getting a key needs no billing account and no card.** `gemini-3.5-flash-lite` (the default model, GA since July 2026) runs free within the [free tier's](https://ai.google.dev/gemini-api/docs/pricing) daily quota; past that, paid rates apply.
 
 1. Get a key at **<https://aistudio.google.com/apikey>**
 2. Put it in your environment:
@@ -99,6 +99,8 @@ Useful flags:
 | --- | --- | --- |
 | `--json` | most commands | Machine-readable output. |
 | `-m, --model <id>` | `research`, `batch` | Override the model. |
+| `-a, --agent <id>` | `research`, `batch` | Submit to a [research agent](#research-agents) instead of a model. Mutually exclusive with `--model`. |
+| `--yes` | `research`, `batch` | Confirm the agent cost without asking. Required for `--agent` when stdin is not a TTY. |
 | `-s, --system <text>` | `research`, `batch` | Set a system instruction. |
 | `-f, --file <path>` | `research` | Read the prompt from a file. |
 | `-t, --tag <tag>` | `research`, `batch`, `list` | Label tasks and filter them. |
@@ -110,7 +112,7 @@ Useful flags:
 | `-n, --limit <n>` | `list` | Cap the rows (non-negative; `0` shows none). |
 | `--format <md\|json>` | `export` | Output format. Default `md`. |
 | `-o, --out <file>` | `export` | Write to a file instead of stdout. |
-| `--dry-run` | `batch`, `prune` | Show what would go; submit/delete nothing. |
+| `--dry-run` | `research`, `batch`, `prune` | Show what would go — including the projected agent spend; submit/delete nothing. |
 | `--raw` | `get` | Dump the raw interaction JSON. |
 
 IDs are the first 8 characters of a UUID. Any unique prefix works, so `gemcatch get 8f3a` is fine.
@@ -153,6 +155,46 @@ $ id=$(gemcatch research "..." --json | jq -r .id)
 $ gemcatch watch "$id" --json | jq -r .result
 ```
 
+## Research agents
+
+The [Gemini Deep Research agents](https://ai.google.dev/gemini-api/docs/deep-research) are reachable only through the Interactions API, and the docs are explicit: *"You must use background execution (set `background=true`) to run the agent asynchronously and poll for results or stream updates."* That is precisely the half of the job `gemcatch` already does — it always sets `background: true`, owns the polling, and its daemon collects results before the free tier drops interactions after **1 day** (paid tier: 55 days). A Deep Research run takes minutes and you were never going to sit there holding the connection; submit it, and let the daemon catch it.
+
+```console
+$ gemcatch research "map the EU AI Act high-risk obligations against the UK approach" --agent deep-research
+Agent deep-research-preview-04-2026 — estimated $1.00–$3.00 for this task (preview rates, subject to change).
+Submit? [y/N] y
+Task 8f3a1c04 submitted. Run: gemcatch get 8f3a1c04 when ready.
+```
+
+`--agent` takes an alias or a raw agent id:
+
+| You type | Sent to the API |
+| --- | --- |
+| `deep-research` | `deep-research-preview-04-2026` |
+| `deep-research-max` | `deep-research-max-preview-04-2026` |
+| anything else | passed through unchanged (future agent ids work without a gemcatch release; a bad id fails fast with the API's own 4xx) |
+
+An agent is sent **instead of** a model — the agent picks its own models — so `--model` and `--agent` together is an error, and nothing is submitted.
+
+**These agents cost real money, per task.** The docs put Deep Research at **$1.00–$3.00 per task** and Deep Research Max at **$3.00–$7.00 per task** — with their own hedge attached: *"These figures are estimates based on preview rates and are subject to change."* Because `gemcatch batch` fires a whole file at once, a 20-line file against `deep-research-max` is a **$60–$140 command**, so every agent submission shows its band and asks first. In a script (stdin not a TTY) you must pass `--yes`; `--dry-run` prints the full projected spend and submits nothing:
+
+```console
+$ gemcatch batch questions.txt --agent deep-research-max --dry-run
+20 prompts × deep-research-max-preview-04-2026 — estimated $60.00–$140.00 total. Nothing submitted (--dry-run).
+```
+
+The report lands like any other result — final answer only, none of the agent's interim plan — and its **citations** come with it. The docs tell you to review them to verify the sources, so `gemcatch get` prints them under the report as a `Sources:` list, `--json` carries them as an array, and they live in the store alongside the result.
+
+An agent run can also come back `incomplete` — that is what a `max_total_tokens` budget cap produces when the run "safely pauses" — which `gemcatch` treats as terminal, exactly like the API does: the daemon retires it and moves on.
+
+The agent recipe, end to end:
+
+```bash
+$ gemcatch batch questions.txt --agent deep-research --yes   # bands shown, N × total quoted
+$ gemcatch daemon --exit-when-idle                           # catch reports before the 1-day expiry
+$ gemcatch export --tag batch-1a2b3c -o reports.md           # every report, with its sources
+```
+
 ## How it works
 
 Tasks live in SQLite at `~/.gemcatch/tasks.db` (override with `GEMCATCH_HOME`):
@@ -160,7 +202,7 @@ Tasks live in SQLite at `~/.gemcatch/tasks.db` (override with `GEMCATCH_HOME`):
 ```sql
 CREATE TABLE tasks (id TEXT PRIMARY KEY, prompt TEXT, interaction_id TEXT,
                     status TEXT DEFAULT 'pending', result TEXT, created_at INTEGER);
--- plus model, system_instruction, tag, error, usage, updated_at
+-- plus model, system_instruction, tag, error, usage, updated_at, agent, citations
 ```
 
 `research` calls `interactions.create({model, input, background: true})` via [`@google/genai`](https://www.npmjs.com/package/@google/genai) and keeps the returned `id`. The polling commands call `interactions.get(id)` and write the status back. Once a task completes, the text is cached in the `result` column — `gemcatch get` then answers from disk without touching the network.
@@ -208,7 +250,7 @@ Transient failures are retried with exponential backoff and full jitter, honouri
 | --- | --- |
 | `GEMINI_API_KEY` | Your API key. `GOOGLE_API_KEY` also works. |
 | `GEMCATCH_HOME` | Where `tasks.db` lives. Default `~/.gemcatch`. |
-| `GEMCATCH_MODEL` | Default model. Default `gemini-3.1-flash-lite`. |
+| `GEMCATCH_MODEL` | Default model. Default `gemini-3.5-flash-lite`. |
 | `GEMCATCH_POLL_MS` | `watch` poll interval in ms. Default `10000`. |
 | `GEMCATCH_DAEMON_S` | `daemon` interval in seconds. Default `300`. |
 | `GEMCATCH_RPM` | Requests/minute ceiling. Default `15` (the free tier). `0` disables pacing. |
