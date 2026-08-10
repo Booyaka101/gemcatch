@@ -51,7 +51,7 @@
     "commander": "^15.0.0"
   },
   "allowScripts": {
-    "@google/genai@2.15.0": true,
+    "@google/genai@2.16.0": true,
     "protobufjs@7.6.5": true
   }
 }
