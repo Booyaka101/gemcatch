@@ -9,3 +9,7 @@
 # author's setting, and the Windows job runs the bin through an npm-generated
 # .cmd shim that never reads the shebang. So it is pinned here instead.
 * text=auto eol=lf
+
+# Collapsed in pull requests and excluded from the language bar. Dependabot
+# opens these weekly and the churn is machine-written, not reviewable by eye.
+package-lock.json linguist-generated=true
