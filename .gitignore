@@ -15,3 +15,6 @@ coverage/
 tasks.db
 tasks.db-wal
 tasks.db-shm
+
+# Local build notes, not for the public repo
+PROGRESS.md
