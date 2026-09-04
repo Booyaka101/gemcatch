@@ -233,17 +233,18 @@ Since a chain bills per turn, `gemcatch stats` keeps a running total across all 
 ```console
 $ gemcatch stats
 Store: ~/.gemcatch/tasks.db
-Tasks: 5
+Tasks: 3
   completed         3
-  failed            1
-  in_progress       1
 Agent runs:
-  deep-research-preview-04-2026      5
-Plan chains: 2 plan, 3 report
-Estimated spend: $5.00–$15.00 across 5 billed task(s) (preview rates, subject to change).
+  deep-research-preview-04-2026      3
+Plan chains: 2 plan, 1 report
+Estimated spend: $3.00–$9.00 across 3 billed task(s) (preview rates, subject to change).
 ```
 
-It's the same published bands applied to what you've actually submitted, not a reading of your bill. An agent with no published band is counted but not priced, and it says so rather than quietly treating it as free.
+That's the chain above: one plan, one refinement, one run, three tasks at the same band. It's the published bands applied to what you actually submitted, not a reading of your bill, and it errs toward telling you rather than flattering you:
+
+- Only runs that **reached the server** are priced. A submit that failed before it left the machine (bad key, rejected agent id) is still counted under "Agent runs" as an attempt, but it costs nothing and isn't billed.
+- An agent with **no published band** totals to `unknown`, never to `$0.00`. Quoting zero for a run that costs real money is the one thing a spend guard must not do.
 
 `list` shows the chain as one thing, and `export` follows it to the report:
 

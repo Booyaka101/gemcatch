@@ -200,6 +200,18 @@ function agentCounts() {
     .all();
 }
 
+// Agent runs that actually reached the server, keyed by agent. A submit that
+// never got an interaction_id (a bad key, a rejected agent id, a network
+// failure) was never billed, so it must not appear in a spend total -- unlike
+// agentCounts(), which tallies every attempt.
+function billedAgentCounts() {
+  return db()
+    .prepare(
+      'SELECT agent, COUNT(*) AS n FROM tasks WHERE agent IS NOT NULL AND interaction_id IS NOT NULL GROUP BY agent'
+    )
+    .all();
+}
+
 // Plan/report totals for `stats`. Ordinary tasks are not a row here; they are
 // already accounted for in counts(), and a store that has never planned reports
 // nothing at all.
@@ -228,6 +240,7 @@ module.exports = {
   prunableTasks,
   counts,
   agentCounts,
+  billedAgentCounts,
   kindCounts,
   close,
 };

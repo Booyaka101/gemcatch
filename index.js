@@ -176,6 +176,10 @@ function estimatedSpend(agentRows) {
     tasks += a.n;
   }
   if (!tasks && !unpriced) return null;
+  // Nothing priced means the total is unknown, NOT zero. Reporting $0.00 for
+  // runs that cost real money is the exact dishonesty this guard exists to
+  // avoid, so low/high are null and the caller says "unknown" instead.
+  if (!tasks) return { low: null, high: null, tasks: 0, unpriced };
   return { low, high, tasks, unpriced };
 }
 
@@ -299,6 +303,17 @@ function needPlan(id, verb) {
       new Error(
         `Plan ${task.id}'s interaction was dropped server-side, so it can no longer be continued.\n` +
           `  ${RETENTION_NOTE}\n` +
+          `  Submit a fresh plan: gemcatch research "<prompt>" --agent ${task.agent || '<agent>'} --plan`
+      )
+    );
+  }
+  // A plan that finished any way other than `completed` is never coming back, so
+  // "wait for it" would be wrong advice. Only a plan still in flight gets
+  // pointed at `watch`.
+  if (isDone(task.status) && !isSuccess(task.status)) {
+    die(
+      new Error(
+        `Plan ${task.id} ended ${task.status}, so there is nothing to ${verb}.\n` +
           `  Submit a fresh plan: gemcatch research "<prompt>" --agent ${task.agent || '<agent>'} --plan`
       )
     );
@@ -1329,7 +1344,9 @@ program
     const agents = store.agentCounts();
     const kinds = store.kindCounts();
     const total = rows.reduce((n, r) => n + r.n, 0);
-    const spend = estimatedSpend(agents);
+    // Priced from the runs that actually reached the server, not from every
+    // attempt: a submit that failed before it left the machine cost nothing.
+    const spend = estimatedSpend(store.billedAgentCounts());
     emit(
       opts.json,
       { db: store.DB_PATH, total, by_status: rows, by_agent: agents, by_kind: kinds, estimated_spend: spend },
@@ -1344,12 +1361,17 @@ program
         if (kinds.length) {
           console.log(`Plan chains: ${kinds.map((k) => `${k.n} ${k.kind}`).join(', ')}`);
         }
-        if (spend) {
+        if (spend && !spend.tasks) {
+          console.log(
+            `Estimated spend: unknown for ${spend.unpriced} agent task(s) on an agent with no published price band.`
+          );
+        } else if (spend) {
+          const rest = spend.unpriced
+            ? `, plus ${spend.unpriced} on an agent with no published band`
+            : '';
           console.log(
             `Estimated spend: $${spend.low.toFixed(2)}–$${spend.high.toFixed(2)} across ${spend.tasks} billed task(s)` +
-              ' (preview rates, subject to change' +
-              (spend.unpriced ? `; ${spend.unpriced} more on an agent with no published band` : '') +
-              ').'
+              ` (preview rates, subject to change)${rest}.`
           );
         }
       }

@@ -1317,6 +1317,62 @@ async function submit(prompt, args, extra) {
   assert(!/Plan chains|Estimated spend/.test(plainStats), `a store with no agent runs says neither: ${plainStats}`);
   ok('stats tallies plan/report turns and totals the estimated spend across every billed turn');
 
+  // ---- the spend total must never overstate or understate what was billed ----
+  // Two ways it could lie, both pinned here: pricing a run that never reached
+  // the server, and quoting $0.00 for a run whose agent has no published band.
+  const spEnv = { GEMCATCH_HOME: path.join(HOME, 'spend-honesty') };
+  fs.mkdirSync(spEnv.GEMCATCH_HOME, { recursive: true });
+  const spDb = new Database(path.join(spEnv.GEMCATCH_HOME, 'tasks.db'));
+  spDb.exec(
+    "CREATE TABLE tasks (id TEXT PRIMARY KEY, prompt TEXT, interaction_id TEXT, status TEXT DEFAULT 'pending', " +
+      'result TEXT, created_at INTEGER, model TEXT, system_instruction TEXT, tag TEXT, error TEXT, usage TEXT, ' +
+      "updated_at INTEGER, agent TEXT, citations TEXT, collaborative_planning INTEGER, " +
+      "previous_interaction_id TEXT, kind TEXT DEFAULT 'task', parent_id TEXT)"
+  );
+  const insSp = spDb.prepare(
+    'INSERT INTO tasks (id,prompt,status,created_at,agent,kind,interaction_id) VALUES (?,?,?,?,?,?,?)'
+  );
+  // Reached the server: billable at $1.00-$3.00.
+  insSp.run('spend001', 'a real agent run', 'completed', 100, 'deep-research-preview-04-2026', 'plan', 'int_s1');
+  // Never left the machine (bad key / rejected id): interaction_id NULL, $0.
+  insSp.run('spend002', 'never submitted', 'failed', 200, 'deep-research-max-preview-04-2026', 'plan', null);
+  spDb.close();
+  const spStats = await out(['stats'], { env: spEnv });
+  assert(
+    /Estimated spend: \$1\.00–\$3\.00 across 1 billed task\(s\) \(preview rates, subject to change\)\./.test(spStats),
+    `a submit that never reached the server must not be priced: ${spStats}`
+  );
+  assert(!/\$4\.00|\$10\.00/.test(spStats), 'the failed submit must not inflate the total');
+  assert(/deep-research-max-preview-04-2026\s+1/.test(spStats), 'though it is still counted as an attempt');
+  ok('stats prices only the runs that reached the server, so a failed submit costs nothing');
+
+  // An agent with no published band totals to UNKNOWN, never to $0.00 --
+  // quoting zero for a run that costs real money is the exact dishonesty the
+  // spend guard exists to prevent.
+  const upEnv = { GEMCATCH_HOME: path.join(HOME, 'unpriced-stats') };
+  fs.mkdirSync(upEnv.GEMCATCH_HOME, { recursive: true });
+  const upDb = new Database(path.join(upEnv.GEMCATCH_HOME, 'tasks.db'));
+  upDb.exec(
+    "CREATE TABLE tasks (id TEXT PRIMARY KEY, prompt TEXT, interaction_id TEXT, status TEXT DEFAULT 'pending', " +
+      'result TEXT, created_at INTEGER, model TEXT, system_instruction TEXT, tag TEXT, error TEXT, usage TEXT, ' +
+      "updated_at INTEGER, agent TEXT, citations TEXT, collaborative_planning INTEGER, " +
+      "previous_interaction_id TEXT, kind TEXT DEFAULT 'task', parent_id TEXT)"
+  );
+  upDb.prepare('INSERT INTO tasks (id,prompt,status,created_at,agent,kind,interaction_id) VALUES (?,?,?,?,?,?,?)')
+    .run('unpr0001', 'a future agent', 'completed', 100, 'future-agent-01-2027', 'report', 'int_u1');
+  upDb.close();
+  const upStats = await out(['stats'], { env: upEnv });
+  assert(
+    /Estimated spend: unknown for 1 agent task\(s\) on an agent with no published price band\./.test(upStats),
+    `an unpriced agent totals to unknown, not zero: ${upStats}`
+  );
+  assert(!/\$0\.00/.test(upStats), 'and never quotes $0.00 for a billable run');
+  const upJson = JSON.parse(await out(['stats', '--json'], { env: upEnv }));
+  assert.strictEqual(upJson.estimated_spend.low, null, 'json reports an unknown total as null, not 0');
+  assert.strictEqual(upJson.estimated_spend.high, null, 'both ends');
+  assert.strictEqual(upJson.estimated_spend.unpriced, 1, 'and counts the unpriced run');
+  ok('stats reports an unpriced agent as unknown spend rather than $0.00');
+
   // ---- approve --dry-run: the band, and nothing sent ----
   const beforeDry = interactions.size;
   const apDry = await out(['approve', refineId, '--dry-run'], { env: chEnv });
@@ -1375,6 +1431,22 @@ async function submit(prompt, args, extra) {
   assert(new RegExp(`gemcatch watch ${ipId}`).test(ip.stderr), 'and how to wait for it');
   assert.strictEqual(interactions.size, beforeIp, 'and nothing was submitted');
   ok('approve on a plan that has not completed fails fast and submits nothing');
+
+  // ---- a plan that ended some other way is not something to wait for ----
+  // "Wait for it: gemcatch watch X" is wrong advice for a cancelled plan; it is
+  // never coming back, so the message has to say so and point at a fresh plan.
+  const cnEnv = { GEMCATCH_HOME: path.join(HOME, 'plan-cancelled') };
+  const cnRun = await cli(['research', 'SLOW plan to cancel', '--agent', 'deep-research', '--plan', '--yes'], { env: cnEnv });
+  const cnId = planIdOf(cnRun.stdout);
+  await out(['cancel', cnId], { env: cnEnv });
+  const beforeCn = interactions.size;
+  const cn = await cli(['approve', cnId, '--yes'], { env: cnEnv }).catch((e) => e);
+  assert.strictEqual(cn.code, 1, 'approving a cancelled plan exits non-zero');
+  assert(new RegExp(`Plan ${cnId} ended cancelled`).test(cn.stderr), `the message names how it ended: ${cn.stderr}`);
+  assert(!/Wait for it/.test(cn.stderr), 'and never tells you to wait for a plan that is finished');
+  assert(/--plan/.test(cn.stderr), 'it points at submitting a fresh plan instead');
+  assert.strictEqual(interactions.size, beforeCn, 'and nothing was submitted');
+  ok('approve on a plan that ended cancelled says so instead of telling you to wait');
 
   // ---- approve on a plan the server has already dropped ----
   // Retired to `incomplete` by the 404 path: name the retention window rather

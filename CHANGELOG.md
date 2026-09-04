@@ -46,12 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report and leaves the intermediate plans out unless `--include-plans` is
   passed; the Markdown sections and the JSON rows now name the turn.
 - `gemcatch stats` now tallies plan and report turns, and totals the estimated
-  spend across every billed agent turn from the same published bands the guard
-  quotes before each one. A chain bills per turn, so a release that turns one
-  submission into three owes the user a running total. It is the documented
-  bands applied to what was submitted, not a reading of your bill, and an agent
-  with no published band is counted but not priced rather than quietly treated
-  as free. A store with no agent runs prints neither line.
+  spend across the agent turns that were actually billed, from the same
+  published bands the guard quotes before each one. A chain bills per turn, so a
+  release that turns one submission into three owes the user a running total. It
+  is the documented bands applied to what was submitted, not a reading of your
+  bill, and it errs toward telling you rather than flattering you: only runs
+  that reached the server are priced (a submit that failed before it left the
+  machine is counted as an attempt but costs nothing), and an agent with no
+  published band totals to `unknown`, never to `$0.00`. A store with no agent
+  runs prints neither line.
 - Additive schema migration: `collaborative_planning`, `previous_interaction_id`,
   `kind` (defaulting to `'task'`) and `parent_id`. A 0.4.0 `tasks.db` upgrades in
   place, keeps every row, and behaves exactly as it did.
