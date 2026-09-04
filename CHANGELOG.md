@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-04
+
+### Added
+
+- **Collaborative planning.** Until now the only agent flow was a blind one-shot
+  bet: gemcatch showed a cost band, asked y/N, and fired. The cost band was
+  everything you knew before spending, and there was no way to check the agent
+  had read the prompt the way you meant it. A 20-line `batch` against
+  `deep-research-max` is a $60–$140 command placed sight unseen. The Deep
+  Research docs have always documented a second mode for exactly this, and
+  gemcatch could not reach it. Now it can:
+
+  - `--plan` on `research` and `batch` submits with
+    `agent_config.collaborative_planning: true`, so **the agent returns a
+    research plan instead of a report**. Still `background: true`, still stored,
+    still collected by the daemon. The row is stored with `kind='plan'`.
+  - `gemcatch get <id>` on a plan prints the plan and then the literal next
+    command, `Approve with: gemcatch approve 8f3a1c04 · Refine with: gemcatch
+    refine 8f3a1c04 "..."`, on stderr, so `get <plan> > plan.md` still captures
+    just the plan.
+  - `gemcatch refine <id> "<instruction>"` sends the instruction back with
+    `previous_interaction_id` and planning still on, and stores the revised plan
+    linked to the one it came from, inheriting its agent and tag.
+  - `gemcatch approve <id>` is the turn that commits: `previous_interaction_id`
+    with `collaborative_planning: false`, stored as `kind='report'` linked to the
+    plan. It shows the cost band and asks, honours `--yes` when stdin is not a
+    TTY, and honours `--dry-run`.
+
+  **Planning is not cheaper.** The docs give one band per task and do not price a
+  planning turn separately, so a planning turn is quoted at the same band and the
+  line says so: *"the docs price per task and do not price a planning turn
+  separately"*. What you get for it is a look at the plan before you commit to
+  the research run, not a discount.
+- `gemcatch list` renders a chain indented under its root, in submission order,
+  and grows a `KIND` column when a listing contains plans or reports (a store
+  with neither keeps the layout it had). `gemcatch export` follows a chain to its
+  report and leaves the intermediate plans out unless `--include-plans` is
+  passed; the Markdown sections and the JSON rows now name the turn.
+- `gemcatch stats` now tallies plan and report turns, and totals the estimated
+  spend across the agent turns that were actually billed, from the same
+  published bands the guard quotes before each one. A chain bills per turn, so a
+  release that turns one submission into three owes the user a running total. It
+  is the documented bands applied to what was submitted, not a reading of your
+  bill, and it errs toward telling you rather than flattering you: only runs
+  that reached the server are priced (a submit that failed before it left the
+  machine is counted as an attempt but costs nothing), and an agent with no
+  published band totals to `unknown`, never to `$0.00`. A store with no agent
+  runs prints neither line.
+- Additive schema migration: `collaborative_planning`, `previous_interaction_id`,
+  `kind` (defaulting to `'task'`) and `parent_id`. A 0.4.0 `tasks.db` upgrades in
+  place, keeps every row, and behaves exactly as it did.
+
+### Fixed
+
+- `approve` and `refine` fail before sending anything when the target is not a
+  plan, or is a plan that has not completed. A plan whose interaction the free
+  tier has already dropped names the retention window (1 day free, 55 days paid)
+  instead of sending a `previous_interaction_id` the server would reject. A plan
+  that expires *after* it completed locally gets the same explanation rather
+  than a bare 404 for an id the user never typed.
+- `--plan` without `--agent` (or with `--model`) is a clean error rather than a
+  flag that quietly does nothing: collaborative planning is an agent feature.
+- Approving the same plan twice submits a second run rather than silently
+  reusing the first, and `list` shows both under their plan.
+
 ## [0.4.0] - 2026-08-08
 
 ### Added
@@ -204,7 +269,8 @@ seen a task complete, the text is cached locally and survives that expiry — bu
 something has to poll inside that window for it to be seen at all, which is what
 `gemcatch daemon` exists to do.
 
-[Unreleased]: https://github.com/Booyaka101/gemcatch/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Booyaka101/gemcatch/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Booyaka101/gemcatch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Booyaka101/gemcatch/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Booyaka101/gemcatch/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Booyaka101/gemcatch/compare/v0.1.1...v0.2.0

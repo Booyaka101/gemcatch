@@ -23,6 +23,12 @@ const AGENT_ALIASES = Object.freeze({
   'deep-research-max': 'deep-research-max-preview-04-2026',
 });
 
+// `agent_config.type` for the config block a collaborative-planning turn sends.
+// Both documented Deep Research agents use the same value, and an unknown
+// pass-through id is assumed to be one too -- collaborative planning is a Deep
+// Research feature, so there is nothing else it could be.
+const AGENT_CONFIG_TYPE = 'deep-research';
+
 // Documented per-task price bands, in dollars, keyed by the RESOLVED id.
 // The docs' own hedge applies -- "These figures are estimates based on
 // preview rates and are subject to change" -- so the spend guard quotes
@@ -360,6 +366,21 @@ async function submit(prompt, opts) {
     ? { agent: o.agent, input: prompt, background: true }
     : { model: o.model || DEFAULT_MODEL, input: prompt, background: true };
   if (o.systemInstruction) body.system_instruction = o.systemInstruction;
+  // collaborative_planning is an `agent_config` field, NOT a top-level one, and
+  // the docs send the whole block (type + thinking_summaries) with it. Sent only
+  // when a plan turn is involved -- agent_config is optional otherwise, so an
+  // ordinary run keeps making exactly the request it always made. Presence, not
+  // truthiness: `false` is the approval turn's real value and must reach the API.
+  if (o.collaborativePlanning !== undefined) {
+    body.agent_config = {
+      type: AGENT_CONFIG_TYPE,
+      thinking_summaries: 'auto',
+      collaborative_planning: !!o.collaborativePlanning,
+    };
+  }
+  // Continues an earlier interaction server-side: the plan is already in that
+  // conversation, so this turn sends only what changed.
+  if (o.previousInteractionId) body.previous_interaction_id = o.previousInteractionId;
   const r = await call(() => {
     const api = sdkInteractions();
     return api
@@ -414,6 +435,7 @@ module.exports = {
   MAX_RETRIES,
   AGENT_ALIASES,
   AGENT_PRICE_BANDS,
+  AGENT_CONFIG_TYPE,
   resolveAgent,
   submit,
   poll,

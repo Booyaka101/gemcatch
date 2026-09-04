@@ -81,8 +81,10 @@ This week in AI: ...
 | `gemcatch research "<prompt>"` | Submits with `background: true`, stores the interaction ID, exits immediately. |
 | `gemcatch batch <file>` | Submits many prompts from a file at once, tagged as one collectable batch. |
 | `gemcatch status <id>` | Polls the API and prints the current state. |
-| `gemcatch get <id>` | Prints the full response if complete, otherwise the current status. |
-| `gemcatch list` | All tasks, newest first: id, age, status, prompt. |
+| `gemcatch get <id>` | Prints the full response if complete, otherwise the current status. On a [plan](#see-the-plan-before-you-pay-for-the-run), the plan plus the approve/refine commands. |
+| `gemcatch refine <id> "<instruction>"` | Sends an instruction back to a plan and returns a revised plan. |
+| `gemcatch approve <id>` | Approves a plan and submits the research run it describes. |
+| `gemcatch list` | All tasks, newest first: id, age, status, prompt. Plan chains are indented under their root. |
 | `gemcatch export` | Concatenates finished results, each under its prompt, to stdout or a file (Markdown or JSON). |
 | `gemcatch digest` | Feeds a tag's completed results through one Gemini call into a single summary. |
 | `gemcatch watch <id>` | Polls until the task finishes, then prints the result. |
@@ -91,7 +93,7 @@ This week in AI: ...
 | `gemcatch cancel <id>` | Asks the API to stop an in-flight task. |
 | `gemcatch rm <ids...>` | Forgets tasks locally. `--remote` deletes them server-side too. |
 | `gemcatch prune` | Drops finished tasks older than `--days` (default 30). |
-| `gemcatch stats` | Where the store lives and what's in it. |
+| `gemcatch stats` | Where the store lives, what's in it, and what the agent runs have plausibly cost. |
 
 Useful flags:
 
@@ -100,7 +102,8 @@ Useful flags:
 | `--json` | most commands | Machine-readable output. |
 | `-m, --model <id>` | `research`, `batch` | Override the model. |
 | `-a, --agent <id>` | `research`, `batch` | Submit to a [research agent](#research-agents) instead of a model. Mutually exclusive with `--model`. |
-| `--yes` | `research`, `batch` | Confirm the agent cost without asking. Required for `--agent` when stdin is not a TTY. |
+| `--plan` | `research`, `batch` | Ask the agent for a [research plan](#see-the-plan-before-you-pay-for-the-run) first, to refine and approve. Needs `--agent`. |
+| `--yes` | `research`, `batch`, `refine`, `approve` | Confirm the agent cost without asking. Required for `--agent` when stdin is not a TTY. |
 | `-s, --system <text>` | `research`, `batch` | Set a system instruction. |
 | `-f, --file <path>` | `research` | Read the prompt from a file. |
 | `-t, --tag <tag>` | `research`, `batch`, `list` | Label tasks and filter them. |
@@ -112,7 +115,8 @@ Useful flags:
 | `-n, --limit <n>` | `list` | Cap the rows (non-negative; `0` shows none). |
 | `--format <md\|json>` | `export` | Output format. Default `md`. |
 | `-o, --out <file>` | `export` | Write to a file instead of stdout. |
-| `--dry-run` | `research`, `batch`, `prune` | Show what would go — including the projected agent spend; submit/delete nothing. |
+| `--include-plans` | `export` | Also emit a chain's plan turns, not just its report. |
+| `--dry-run` | `research`, `batch`, `refine`, `approve`, `prune` | Show what would go — including the projected agent spend; submit/delete nothing. |
 | `--raw` | `get` | Dump the raw interaction JSON. |
 
 IDs are the first 8 characters of a UUID. Any unique prefix works, so `gemcatch get 8f3a` is fine.
@@ -187,13 +191,96 @@ The report lands like any other result — final answer only, none of the agent'
 
 An agent run can also come back `incomplete` — that is what a `max_total_tokens` budget cap produces when the run "safely pauses" — which `gemcatch` treats as terminal, exactly like the API does: the daemon retires it and moves on.
 
+### See the plan before you pay for the run
+
+A cost band tells you what a run will cost. It tells you nothing about whether the agent understood the question. Add `--plan` and it doesn't start researching: with `agent_config.collaborative_planning: true`, *"the agent returns a research plan instead of a full report"*. You read it, push back on it, and approve it when it's right.
+
+```console
+$ gemcatch research "map the EU AI Act high-risk obligations against the UK approach" --agent deep-research --plan -t euuk
+Agent deep-research-preview-04-2026 (planning turn) — estimated $1.00–$3.00 for this task (preview rates, subject to change; the docs price per task and do not price a planning turn separately).
+Submit? [y/N] y
+Plan task d014e21b submitted. Run: gemcatch get d014e21b when ready.
+
+$ gemcatch get d014e21b
+Research plan
+
+1. Scope the EU AI Act high-risk regime: Annex III use cases, Article 6 classification,
+   and the Chapter III obligations (risk management, data governance, logging, human
+   oversight, conformity assessment) with their August 2026 / August 2027 dates.
+2. Scope the UK approach: the five cross-sector principles, the regulator-led model
+   (ICO, FCA, MHRA, Ofcom), and what is guidance rather than statute.
+3. Build an obligation-by-obligation comparison table: EU requirement, nearest UK
+   equivalent, whether it is binding, and who enforces it.
+4. Flag the gaps in both directions and the compliance implications for a firm
+   operating in both.
+Approve with: gemcatch approve d014e21b   ·   Refine with: gemcatch refine d014e21b "..."
+
+$ gemcatch refine d014e21b "cut the history, and add enforcement penalties on both sides"
+Plan task 2140e699 submitted (refines d014e21b). Run: gemcatch get 2140e699 when ready.
+
+$ gemcatch approve 2140e699
+Agent deep-research-preview-04-2026 — estimated $1.00–$3.00 for this task (preview rates, subject to change).
+Submit? [y/N] y
+Task 96e8209b submitted (approves plan 2140e699).
+```
+
+Every turn is an ordinary background task: stored, polled, and collected by the daemon before the 1-day expiry, same as everything else. `refine` chains as many times as you like; each revision inherits the agent and tag of the plan it came from.
+
+**A planning turn is a task, and it is billed as one.** The docs publish one band per task and price no planning turn separately, so `gemcatch` quotes the same band for it and says exactly that on the line. What `--plan` buys you is a look at the plan before you commit to the research run, not a discount. Budget for the plan, each refinement, and the run.
+
+Since a chain bills per turn, `gemcatch stats` keeps a running total across all of them:
+
+```console
+$ gemcatch stats
+Store: ~/.gemcatch/tasks.db
+Tasks: 3
+  completed         3
+Agent runs:
+  deep-research-preview-04-2026      3
+Plan chains: 2 plan, 1 report
+Estimated spend: $3.00–$9.00 across 3 billed task(s) (preview rates, subject to change).
+```
+
+That's the chain above: one plan, one refinement, one run, three tasks at the same band. It's the published bands applied to what you actually submitted, not a reading of your bill, and it errs toward telling you rather than flattering you:
+
+- Only runs that **reached the server** are priced. A submit that failed before it left the machine (bad key, rejected agent id) is still counted under "Agent runs" as an attempt, but it costs nothing and isn't billed.
+- An agent with **no published band** totals to `unknown`, never to `$0.00`. Quoting zero for a run that costs real money is the one thing a spend guard must not do.
+
+`list` shows the chain as one thing, and `export` follows it to the report:
+
+```console
+$ gemcatch list
+ID        AGE   STATUS           KIND    AGENT              PROMPT
+d014e21b  22s   completed        plan    deep-research      map the EU AI Act high-risk obligations against the UK ap...
+2140e699  12s   completed        plan    deep-research      └─ cut the history, and add enforcement penalties on both sides
+96e8209b  7s    completed        report  deep-research        └─ map the EU AI Act high-risk obligations against the UK ap...
+
+$ gemcatch export --tag euuk -o report.md
+Wrote 1 result(s) to report.md.
+```
+
+The plans are working notes on the way to the report, so `export` leaves them out; pass `--include-plans` if you want the whole chain in the document. The report is filed under the question that started the chain rather than the one-line approval actually sent to the API, so an exported document reads as research.
+
+A few things that will bite otherwise:
+
+- `--plan` needs `--agent`. Collaborative planning is an agent feature, so `--plan --model ...` (or `--plan` on its own) is an error, not a no-op.
+- `approve` only works on a plan that has completed. Anything else fails before a request goes out.
+- On the free tier the plan's interaction is dropped after a day. Once that happens the chain cannot be continued. `approve` says so and names the window instead of sending a `previous_interaction_id` the server will reject. Run the daemon, or approve the same day.
+- Approving twice submits twice. There is no dedupe, and both runs show up under the plan in `list`.
+- `--plan` and `--watch` work together: `gemcatch research "..." --agent deep-research --plan -w` waits for the plan and then prints it.
+
 The agent recipe, end to end:
 
 ```bash
-$ gemcatch batch questions.txt --agent deep-research --yes   # bands shown, N × total quoted
-$ gemcatch daemon --exit-when-idle                           # catch reports before the 1-day expiry
-$ gemcatch export --tag batch-1a2b3c -o reports.md           # every report, with its sources
+$ gemcatch batch questions.txt --agent deep-research --plan --yes   # a plan per prompt, N × band quoted
+$ gemcatch daemon --exit-when-idle                                  # catch the plans
+$ gemcatch list --tag batch-1a2b3c                                  # read them, approve the good ones
+$ gemcatch approve 8f3a1c04 --yes
+$ gemcatch daemon --exit-when-idle                                  # catch the reports before the 1-day expiry
+$ gemcatch export --tag batch-1a2b3c -o reports.md                  # every report, with its sources
 ```
+
+Drop `--plan` and the first two lines become the 0.4.0 one-shot flow, which still works exactly as it did.
 
 ## How it works
 
@@ -202,7 +289,8 @@ Tasks live in SQLite at `~/.gemcatch/tasks.db` (override with `GEMCATCH_HOME`):
 ```sql
 CREATE TABLE tasks (id TEXT PRIMARY KEY, prompt TEXT, interaction_id TEXT,
                     status TEXT DEFAULT 'pending', result TEXT, created_at INTEGER);
--- plus model, system_instruction, tag, error, usage, updated_at, agent, citations
+-- plus model, system_instruction, tag, error, usage, updated_at, agent, citations,
+--      collaborative_planning, previous_interaction_id, kind, parent_id
 ```
 
 `research` calls `interactions.create({model, input, background: true})` via [`@google/genai`](https://www.npmjs.com/package/@google/genai) and keeps the returned `id`. The polling commands call `interactions.get(id)` and write the status back. Once a task completes, the text is cached in the `result` column — `gemcatch get` then answers from disk without touching the network.
