@@ -126,6 +126,12 @@ function parseCitations(raw) {
 // The bands are quoted with the docs' own hedge ("estimates based on preview
 // rates and subject to change"), never as authoritative.
 
+// A planning turn is a task and is billed as one. The docs publish ONE band per
+// task and price no planning turn separately, so it is quoted at the same band
+// and the line says so outright. Planning buys you a look at the plan before you
+// commit to the research run; it does not buy you a discount.
+const PLAN_NOTE = 'the docs price per task and do not price a planning turn separately';
+
 function bandText(agentId, count) {
   const band = gemini.AGENT_PRICE_BANDS[agentId];
   if (!band) return 'no published price band for this agent';
@@ -135,9 +141,47 @@ function bandText(agentId, count) {
     : `estimated ${money(band[0])}–${money(band[1])} for this task`;
 }
 
-function spendLine(agentId, count) {
+function spendLine(agentId, count, planning) {
   const head = count > 1 ? `${count} prompts × ${agentId}` : `Agent ${agentId}`;
-  return `${head} — ${bandText(agentId, count)}`;
+  return `${head}${planning ? ' (planning turn)' : ''} — ${bandText(agentId, count)}`;
+}
+
+// The parenthetical after the band. `hedge` is the docs' "preview rates" caveat,
+// which the confirmation carries; --dry-run already reads as a projection.
+function spendNote(planning, hedge) {
+  const parts = [];
+  if (hedge) parts.push('preview rates, subject to change');
+  if (planning) parts.push(PLAN_NOTE);
+  return parts.length ? ` (${parts.join('; ')})` : '';
+}
+
+// What the agent runs in the store have plausibly cost, from the same per-task
+// bands the guard quotes before each one. A plan chain bills per turn, so this
+// counts plans and refinements alongside reports -- that is the number worth
+// knowing. Agents with no published band are counted separately rather than
+// silently priced at zero. Null when nothing has been billed at all.
+function estimatedSpend(agentRows) {
+  let low = 0;
+  let high = 0;
+  let tasks = 0;
+  let unpriced = 0;
+  for (const a of agentRows) {
+    const band = gemini.AGENT_PRICE_BANDS[a.agent];
+    if (!band) {
+      unpriced += a.n;
+      continue;
+    }
+    low += band[0] * a.n;
+    high += band[1] * a.n;
+    tasks += a.n;
+  }
+  if (!tasks && !unpriced) return null;
+  return { low, high, tasks, unpriced };
+}
+
+// One sentence for a --dry-run: the band, the honesty note, and that nothing went.
+function dryRunSpend(agentId, count, planning) {
+  return `${spendLine(agentId, count, planning)}${spendNote(planning, false)}. Nothing submitted (--dry-run).`;
 }
 
 function askYesNo(question) {
@@ -154,8 +198,8 @@ function askYesNo(question) {
 // Returns only when the submission is confirmed; otherwise it exits (declined)
 // or throws (no way to ask). Runs BEFORE any row is written, so a declined or
 // refused submission leaves the tasks table untouched.
-async function confirmSpend(agentId, count, opts) {
-  console.error(`${spendLine(agentId, count)} (preview rates, subject to change).`);
+async function confirmSpend(agentId, count, opts, planning) {
+  console.error(`${spendLine(agentId, count, planning)}${spendNote(planning, true)}.`);
   if (opts.yes) return;
   // GEMCATCH_ASSUME_TTY lets the offline suite drive the interactive branch
   // through a pipe; real non-TTY callers (cron, CI, scripts) must say --yes.
@@ -177,7 +221,18 @@ async function confirmSpend(agentId, count, opts) {
 // only when the user actually typed it -- commander fills in the default
 // otherwise, and the default must not poison every agent run.
 function resolveAgentOpts(opts, cmd) {
-  if (!opts.agent) return null;
+  if (!opts.agent) {
+    // Collaborative planning is an agent_config field on an agent run. A model
+    // run has no plan turn at all, so --plan without --agent is a mistake worth
+    // naming rather than a flag that quietly does nothing.
+    if (opts.plan) {
+      throw new Error(
+        '--plan is a research-agent feature: collaborative planning applies to an agent, not a model, ' +
+          'and a model run has no plan turn.\n  Try: --agent deep-research --plan'
+      );
+    }
+    return null;
+  }
   if (cmd.getOptionValueSource('model') === 'cli') {
     throw new Error(
       '--model and --agent are mutually exclusive: an agent run is submitted with `agent` ' +
@@ -185,6 +240,159 @@ function resolveAgentOpts(opts, cmd) {
     );
   }
   return gemini.resolveAgent(opts.agent);
+}
+
+// --- plan chains ----------------------------------------------------------
+
+// `collaborative_planning: true` makes the agent return a research plan instead
+// of a report. That plan is a decision point, not a deliverable: you read it,
+// optionally `refine` it, and `approve` it to spend on the research run itself.
+// Each turn is its own task row, linked to the one it continues by parent_id
+// locally and by previous_interaction_id on the wire.
+
+// What the approval turn sends as `input`. The plan is already in the
+// conversation via previous_interaction_id, so this turn only has to say yes --
+// the docs' own example sends a one-line confirmation, not the question again.
+const APPROVE_INPUT = 'Plan looks good, proceed with the research.';
+
+// The reason refresh() records when a poll 404s. Named because `approve` reads
+// it back to tell an expired plan apart from any other terminal one.
+const EXPIRED_ERROR = 'interaction not found (expired or deleted)';
+
+const RETENTION_NOTE =
+  'The Interactions API retains interactions for 1 day on the free tier (55 days on paid).';
+
+// A finished plan is a decision point, so the next command is spelled out under
+// it. Guidance, so it goes to stderr like the rest -- `gemcatch get <plan> >
+// plan.md` still captures only the plan.
+function planFooter(task) {
+  return `Approve with: gemcatch approve ${task.id}   ·   Refine with: gemcatch refine ${task.id} "..."`;
+}
+
+// The result payload for `get`/`watch`. The plan-chain fields ride along only on
+// a plan row, so a model run's --json shape is exactly what it always was.
+function resultPayload(task, status, result, citations) {
+  const p = { id: task.id, status, result, citations: citations || null };
+  if (task.kind === 'plan') {
+    p.kind = 'plan';
+    p.approve = `gemcatch approve ${task.id}`;
+    p.refine = `gemcatch refine ${task.id} "<instruction>"`;
+  }
+  return p;
+}
+
+// Both continuation commands need the same thing: a plan row that completed and
+// whose interaction the server can still resolve. Anything else exits here,
+// before a row is written or a request is sent.
+function needPlan(id, verb) {
+  const task = needTask(id);
+  if (task.kind !== 'plan') {
+    die(
+      new Error(
+        `Task ${task.id} is not a plan (kind: ${task.kind || 'task'}), so there is nothing to ${verb}.\n` +
+          '  Plans come from: gemcatch research "<prompt>" --agent deep-research --plan'
+      )
+    );
+  }
+  if (task.status === 'incomplete' && task.error === EXPIRED_ERROR) {
+    die(
+      new Error(
+        `Plan ${task.id}'s interaction was dropped server-side, so it can no longer be continued.\n` +
+          `  ${RETENTION_NOTE}\n` +
+          `  Submit a fresh plan: gemcatch research "<prompt>" --agent ${task.agent || '<agent>'} --plan`
+      )
+    );
+  }
+  if (!isSuccess(task.status)) {
+    die(
+      new Error(
+        `Plan ${task.id} has not completed yet (status: ${task.status}), so there is nothing to ${verb}.\n` +
+          `  Wait for it: gemcatch watch ${task.id}`
+      )
+    );
+  }
+  if (!task.interaction_id) die(new Error(`Plan ${task.id} was never submitted.`));
+  return task;
+}
+
+// A plan can complete locally and still expire server-side before you approve
+// it, in which case the continuation 404s on an id the user never typed. Name
+// the retention window instead of passing that through raw.
+function expiredHint(err, plan) {
+  if (!err || err.httpStatus !== 404) return err;
+  const e = new Error(
+    `the plan's interaction (${plan.interaction_id}) is gone server-side, so it cannot be continued.\n` +
+      `  ${RETENTION_NOTE}\n` +
+      `  Submit a fresh plan: gemcatch research "<prompt>" --agent ${plan.agent || '<agent>'} --plan`
+  );
+  e.code = 'API_ERROR';
+  e.httpStatus = 404;
+  return e;
+}
+
+// A report row is displayed under the question that started the chain rather
+// than the "plan looks good" line actually sent -- that is what keeps `list` and
+// `export` reading as research instead of as protocol chatter.
+function rootPrompt(task) {
+  let cur = task;
+  const seen = new Set([task.id]);
+  while (cur.parent_id && !seen.has(cur.parent_id)) {
+    seen.add(cur.parent_id);
+    const parent = store.getTask(cur.parent_id);
+    if (!parent) break;
+    cur = parent;
+  }
+  return cur.prompt;
+}
+
+// `refine` (another plan) and `approve` (the report) are the same submission --
+// same agent, same tag, linked to the plan by previous_interaction_id --
+// differing only in the collaborative_planning flag they send, the kind they
+// store and the line they print. So they share one path, and the spend guard is
+// on it exactly once.
+async function continuePlan(plan, opts, turn) {
+  let id;
+  try {
+    if (opts.dryRun) {
+      emit(
+        opts.json,
+        {
+          dry_run: true,
+          agent: plan.agent,
+          kind: turn.kind,
+          parent_id: plan.id,
+          previous_interaction_id: plan.interaction_id,
+          input: turn.input,
+        },
+        () => console.log(dryRunSpend(plan.agent, 1, turn.planning))
+      );
+      return;
+    }
+    await confirmSpend(plan.agent, 1, opts, turn.planning);
+    id = store.createTask({
+      prompt: turn.prompt,
+      agent: plan.agent,
+      tag: plan.tag,
+      kind: turn.kind,
+      parentId: plan.id,
+      collaborativePlanning: turn.planning,
+      previousInteractionId: plan.interaction_id,
+    });
+    const r = await gemini.submit(turn.input, {
+      agent: plan.agent,
+      collaborativePlanning: turn.planning,
+      previousInteractionId: plan.interaction_id,
+    });
+    store.setInteraction(id, r.interactionId, r.status);
+    emit(
+      opts.json,
+      { id, interaction_id: r.interactionId, status: r.status, kind: turn.kind, parent_id: plan.id },
+      () => console.log(turn.line(id))
+    );
+  } catch (err) {
+    markSubmitFailure(id, err);
+    die(expiredHint(err, plan));
+  }
 }
 
 // --- input ----------------------------------------------------------------
@@ -230,7 +438,7 @@ async function refresh(task) {
     // the end of time. Any other error (5xx, network) is transient and is
     // re-thrown for the caller to retry on its next pass.
     if (err && err.httpStatus === 404) {
-      store.setStatus(task.id, 'incomplete', { error: 'interaction not found (expired or deleted)' });
+      store.setStatus(task.id, 'incomplete', { error: EXPIRED_ERROR });
       return { status: 'incomplete', text: null, usage: null, raw: null };
     }
     throw err;
@@ -247,6 +455,18 @@ async function refresh(task) {
   if (r.usage) extra.usage = JSON.stringify(r.usage);
   store.setStatus(task.id, r.status, extra);
   return r;
+}
+
+// Only a failed *submit* should mark a task failed. Once it has an
+// interaction_id it is live on the server, and a later watch/poll error must
+// never overwrite it to failed -- that would drop it from the active set and the
+// daemon would abandon a task whose result is still coming. Leave it active; the
+// daemon (or a later `get`) collects it. Every command that submits calls this
+// on its way out, so the rule cannot drift between them.
+function markSubmitFailure(id, err) {
+  if (!id) return;
+  const t = store.getTask(id);
+  if (!t || !t.interaction_id) store.setStatus(id, 'failed', { error: err.message });
 }
 
 // Bounds how many polls are open at once. The *rate* limit is enforced in
@@ -280,6 +500,7 @@ program
   .option('-f, --file <path>', 'read the prompt from a file')
   .option('-m, --model <id>', 'model to use', gemini.DEFAULT_MODEL)
   .option('-a, --agent <id>', 'submit to a research agent instead of a model (e.g. deep-research)')
+  .option('--plan', 'ask the agent for a research plan first, to refine and approve (needs --agent)')
   .option('-s, --system <text>', 'system instruction')
   .option('-t, --tag <tag>', 'label for filtering with `gemcatch list --tag`')
   .option('-w, --watch', 'wait for the result instead of exiting')
@@ -292,44 +513,50 @@ program
     try {
       const agent = resolveAgentOpts(opts, cmd);
       const prompt = await resolvePrompt(promptArg, opts);
+      // undefined, not false: an ordinary run must keep sending no agent_config
+      // at all, exactly as it did before collaborative planning existed.
+      const planning = opts.plan ? true : undefined;
       if (opts.dryRun) {
-        emit(opts.json, { dry_run: true, agent: agent || null, model: agent ? null : opts.model, prompt }, () => {
-          if (agent) console.log(`${spendLine(agent, 1)}. Nothing submitted (--dry-run).`);
-          else console.log(`Would submit to ${opts.model}: ${snippet(prompt)}. Nothing submitted (--dry-run).`);
-        });
+        emit(
+          opts.json,
+          { dry_run: true, agent: agent || null, model: agent ? null : opts.model, plan: !!opts.plan, prompt },
+          () => {
+            if (agent) console.log(dryRunSpend(agent, 1, opts.plan));
+            else console.log(`Would submit to ${opts.model}: ${snippet(prompt)}. Nothing submitted (--dry-run).`);
+          }
+        );
         return;
       }
-      if (agent) await confirmSpend(agent, 1, opts);
+      if (agent) await confirmSpend(agent, 1, opts, opts.plan);
       id = store.createTask({
         prompt,
         model: agent ? null : opts.model,
         agent,
         systemInstruction: opts.system,
         tag: opts.tag,
+        kind: opts.plan ? 'plan' : 'task',
+        collaborativePlanning: planning,
       });
-      const r = await gemini.submit(prompt, { model: opts.model, agent, systemInstruction: opts.system });
+      const r = await gemini.submit(prompt, {
+        model: opts.model,
+        agent,
+        systemInstruction: opts.system,
+        collaborativePlanning: planning,
+      });
       store.setInteraction(id, r.interactionId, r.status);
       if (opts.watch) {
         // Under --watch the submit line is progress, not the answer, so it
         // goes to stderr -- `gemcatch research -w "..." > out.txt` then captures
         // only the result.
-        if (!opts.json) console.error(edim(`Task ${id} submitted.`));
+        if (!opts.json) console.error(edim(`${opts.plan ? 'Plan task' : 'Task'} ${id} submitted.`));
         await watchTask(store.getTask(id), DEFAULT_POLL_MS, opts.json);
         return;
       }
-      emit(opts.json, { id, interaction_id: r.interactionId, status: r.status }, () =>
-        console.log(`Task ${id} submitted. Run: gemcatch get ${id} when ready.`)
+      emit(opts.json, { id, interaction_id: r.interactionId, status: r.status, kind: opts.plan ? 'plan' : 'task' }, () =>
+        console.log(`${opts.plan ? 'Plan task' : 'Task'} ${id} submitted. Run: gemcatch get ${id} when ready.`)
       );
     } catch (err) {
-      // Only a failed *submit* should mark the task failed. Once it has an
-      // interaction_id it is live on the server, and a later watch/poll error
-      // must never overwrite it to failed -- that would drop it from the active
-      // set and the daemon would abandon a task whose result is still coming.
-      // Leave it active; the daemon (or a later `get`) collects it.
-      if (id) {
-        const t = store.getTask(id);
-        if (!t || !t.interaction_id) store.setStatus(id, 'failed', { error: err.message });
-      }
+      markSubmitFailure(id, err);
       die(err);
     }
   });
@@ -412,6 +639,7 @@ program
   .argument('<file>', 'prompts file — one per line, or "-" to read stdin')
   .option('-m, --model <id>', 'model to use', gemini.DEFAULT_MODEL)
   .option('-a, --agent <id>', 'submit every prompt to a research agent instead of a model')
+  .option('--plan', 'ask the agent for a research plan per prompt, to refine and approve (needs --agent)')
   .option('-s, --system <text>', 'system instruction')
   .option('-t, --tag <tag>', 'tag the whole batch (default: batch-<hex>)')
   .option('--separator <str>', 'split the file on this delimiter line for multi-line prompts')
@@ -434,11 +662,14 @@ program
       // Auto-tag so the batch is collectable as a unit; a user tag wins.
       const tag = opts.tag || `batch-${crypto.randomUUID().slice(0, 6)}`;
 
+      // undefined, not false: an ordinary run must keep sending no agent_config.
+      const planning = opts.plan ? true : undefined;
+
       if (opts.dryRun) {
-        emit(opts.json, { tag, dry_run: true, agent: agent || null, prompts }, () => {
+        emit(opts.json, { tag, dry_run: true, agent: agent || null, plan: !!opts.plan, prompts }, () => {
           if (agent) {
             // The whole point of the guard: N × the per-task band, up front.
-            console.log(`${spendLine(agent, prompts.length)}. Nothing submitted (--dry-run).`);
+            console.log(dryRunSpend(agent, prompts.length, opts.plan));
           } else {
             console.log(`Batch ${tag}: ${prompts.length} prompt(s) would be submitted:`);
             for (const p of prompts) console.log(`  ${snippet(p)}`);
@@ -449,14 +680,27 @@ program
 
       // An agent batch multiplies a per-task dollar band by the whole file, so
       // it is confirmed as one total before a single row is written.
-      if (agent) await confirmSpend(agent, prompts.length, opts);
+      if (agent) await confirmSpend(agent, prompts.length, opts, opts.plan);
 
       // One failed submit must not sink the batch: mark that task failed and
       // keep going. mapLimit preserves input order, so the report is stable.
       const results = await mapLimit(prompts, 4, async (prompt) => {
-        const id = store.createTask({ prompt, model: agent ? null : opts.model, agent, systemInstruction: opts.system, tag });
+        const id = store.createTask({
+          prompt,
+          model: agent ? null : opts.model,
+          agent,
+          systemInstruction: opts.system,
+          tag,
+          kind: opts.plan ? 'plan' : 'task',
+          collaborativePlanning: planning,
+        });
         try {
-          const r = await gemini.submit(prompt, { model: opts.model, agent, systemInstruction: opts.system });
+          const r = await gemini.submit(prompt, {
+            model: opts.model,
+            agent,
+            systemInstruction: opts.system,
+            collaborativePlanning: planning,
+          });
           store.setInteraction(id, r.interactionId, r.status);
           return { id, interaction_id: r.interactionId, status: r.status, prompt };
         } catch (err) {
@@ -484,9 +728,16 @@ program
           const pad = ' '.repeat(Math.max(0, 16 - status.length));
           console.log(`${r.id}  ${colorStatus(status)}${pad} ${snippet(r.prompt)}`);
         }
-        console.log(dim('\nCollect them:'));
-        console.log(dim('  gemcatch daemon --exit-when-idle'));
-        console.log(dim(`  gemcatch list --tag ${tag} --status completed`));
+        if (opts.plan) {
+          console.log(dim('\nCollect the plans, then approve the ones worth running:'));
+          console.log(dim('  gemcatch daemon --exit-when-idle'));
+          console.log(dim(`  gemcatch list --tag ${tag}`));
+          console.log(dim('  gemcatch get <id>   # prints the plan and the approve command'));
+        } else {
+          console.log(dim('\nCollect them:'));
+          console.log(dim('  gemcatch daemon --exit-when-idle'));
+          console.log(dim(`  gemcatch list --tag ${tag} --status completed`));
+        }
       });
     } catch (err) {
       die(err);
@@ -530,17 +781,19 @@ program
       // -- re-polling it would 404 after 24h, the very thing we cache to avoid.
       if (isSuccess(task.status) && task.result != null && !opts.raw) {
         const cits = parseCitations(task.citations);
-        emit(opts.json, { id: task.id, status: task.status, result: task.result, citations: cits }, () =>
-          console.log(withSources(task.result, cits))
-        );
+        emit(opts.json, resultPayload(task, task.status, task.result, cits), () => {
+          console.log(withSources(task.result, cits));
+          if (task.kind === 'plan') console.error(planFooter(task));
+        });
         return;
       }
       const r = await refresh(task);
       if (opts.raw) return console.log(JSON.stringify(r.raw, null, 2));
       if (isSuccess(r.status)) {
-        emit(opts.json, { id: task.id, status: r.status, result: r.text, citations: r.citations || null }, () =>
-          console.log(withSources(r.text, r.citations))
-        );
+        emit(opts.json, resultPayload(task, r.status, r.text, r.citations), () => {
+          console.log(withSources(r.text, r.citations));
+          if (task.kind === 'plan') console.error(planFooter(task));
+        });
       } else if (isDone(r.status)) {
         emit(opts.json, { id: task.id, status: r.status, error: r.text || null }, () =>
           console.log(`Task ${task.id}: ${colorStatus(r.status)}${r.text ? `\n${r.text}` : ''}`)
@@ -556,7 +809,79 @@ program
     }
   });
 
+// --- refine / approve -----------------------------------------------------
+
+program
+  .command('refine')
+  .argument('<id>', 'plan task id')
+  .argument('<instruction>', 'what the plan should do differently')
+  .option('--yes', 'confirm the agent cost without asking (required when stdin is not a TTY)')
+  .option('--dry-run', 'show what it would cost; submit nothing')
+  .option('--json', 'machine-readable output')
+  .description('send an instruction back to a plan and get a revised plan')
+  .action(async (id, instruction, opts) => {
+    const text = (instruction || '').trim();
+    if (!text) {
+      return die(new Error('provide an instruction, e.g. gemcatch refine 8f3a1c04 "focus on enforcement dates"'));
+    }
+    const plan = needPlan(id, 'refine');
+    await continuePlan(plan, opts, {
+      planning: true,
+      kind: 'plan',
+      input: text,
+      prompt: text,
+      line: (newId) => `Plan task ${newId} submitted (refines ${plan.id}). Run: gemcatch get ${newId} when ready.`,
+    });
+  });
+
+program
+  .command('approve')
+  .argument('<id>', 'plan task id')
+  .option('--yes', 'confirm the agent cost without asking (required when stdin is not a TTY)')
+  .option('--dry-run', 'show what it would cost; submit nothing')
+  .option('--json', 'machine-readable output')
+  .description('approve a plan and submit the research run it describes')
+  .action(async (id, opts) => {
+    const plan = needPlan(id, 'approve');
+    await continuePlan(plan, opts, {
+      planning: false,
+      kind: 'report',
+      input: APPROVE_INPUT,
+      prompt: rootPrompt(plan),
+      line: (newId) => `Task ${newId} submitted (approves plan ${plan.id}).`,
+    });
+  });
+
 // --- list -----------------------------------------------------------------
+
+// A plan chain is one piece of work, so it is listed as one: the root in its
+// normal newest-first position, its continuations indented under it in the order
+// they were submitted. A row whose parent is filtered out of this listing (by
+// --status, --tag or -n) is rendered as its own root rather than dropped.
+function chainOrder(tasks) {
+  const present = new Set(tasks.map((t) => t.id));
+  const kids = new Map();
+  for (const t of tasks) {
+    if (!t.parent_id || !present.has(t.parent_id)) continue;
+    if (!kids.has(t.parent_id)) kids.set(t.parent_id, []);
+    kids.get(t.parent_id).push(t);
+  }
+  for (const list of kids.values()) list.sort((a, b) => a.created_at - b.created_at);
+  const out = [];
+  const seen = new Set();
+  const walk = (t, depth) => {
+    if (seen.has(t.id)) return;
+    seen.add(t.id);
+    out.push({ task: t, depth });
+    for (const c of kids.get(t.id) || []) walk(c, depth + 1);
+  };
+  for (const t of tasks) if (!t.parent_id || !present.has(t.parent_id)) walk(t, 0);
+  // A listing must never lose a row. Nothing the CLI writes can put a cycle in
+  // parent_id, but a row that is unreachable from any root would otherwise
+  // vanish silently, so anything left over is rendered flat.
+  for (const t of tasks) walk(t, 0);
+  return out;
+}
 
 program
   .command('list')
@@ -578,21 +903,27 @@ program
       console.log('No tasks yet. Submit one:  gemcatch research "your question"');
       return;
     }
-    // The AGENT column only appears when something in the listing used one, so
-    // a pure-model store keeps the compact four-column layout it always had.
-    // Agent ids are shown compact -- the "-preview-MM-YYYY" suffix is version
-    // noise in a table (the full id is in --json and in stats).
+    // The AGENT and KIND columns only appear when something in the listing uses
+    // them, so a pure-model store keeps the compact four-column layout it always
+    // had. Agent ids are shown compact -- the "-preview-MM-YYYY" suffix is
+    // version noise in a table (the full id is in --json and in stats).
     const showAgent = tasks.some((t) => t.agent);
+    const showKind = tasks.some((t) => t.kind && t.kind !== 'task');
     const shortAgent = (a) => (a ? a.replace(/-preview-\d{2}-\d{4}$/, '') : '-');
-    console.log(dim(`ID        AGE   STATUS           ${showAgent ? 'AGENT              ' : ''}PROMPT`));
-    for (const t of tasks) {
-      const snip = snippet(t.prompt);
+    console.log(
+      dim(`ID        AGE   STATUS           ${showKind ? 'KIND    ' : ''}${showAgent ? 'AGENT              ' : ''}PROMPT`)
+    );
+    for (const { task: t, depth } of chainOrder(tasks)) {
       const status = t.status || PENDING;
       // Pad before colouring: ANSI codes would break the column width.
       const pad = ' '.repeat(Math.max(0, 16 - status.length));
+      const kindCol = showKind ? `${(t.kind || 'task').padEnd(7)} ` : '';
       const agentCol = showAgent ? `${shortAgent(t.agent).padEnd(18)} ` : '';
+      // Indent the prompt, not the id: the fixed-width columns stay aligned and
+      // the chain still reads as one thing.
+      const branch = depth ? `${'  '.repeat(depth - 1)}└─ ` : '';
       console.log(
-        `${t.id}  ${age(t.created_at).padEnd(4)}  ${colorStatus(status)}${pad} ${agentCol}${snip}`
+        `${t.id}  ${age(t.created_at).padEnd(4)}  ${colorStatus(status)}${pad} ${kindCol}${agentCol}${branch}${snippet(t.prompt)}`
       );
     }
   });
@@ -609,6 +940,7 @@ program
   .addOption(new Option('--status <status>', 'only this status').choices(ALL_STATUSES).default('completed'))
   .addOption(new Option('--format <fmt>', 'output format').choices(['md', 'json']).default('md'))
   .option('-o, --out <file>', 'write to a file instead of stdout')
+  .option('--include-plans', 'also export the plan turns of a chain, not just its report')
   .description('concatenate finished results, each under its prompt, to stdout or a file')
   .action((opts) => {
     const tasks = store.listTasks({ tag: opts.tag, status: opts.status });
@@ -617,11 +949,19 @@ program
     tasks.reverse();
     // Only rows that actually carry a result are worth exporting: a status
     // filter other than `completed` can match tasks that never stored text.
-    const rows = tasks.filter((t) => t.result != null);
+    // A chain's plan turns are working notes on the way to its report, so an
+    // export of a tag follows the chain to the report and leaves them out
+    // unless they were asked for.
+    const rows = tasks.filter((t) => t.result != null && (opts.includePlans || t.kind !== 'plan'));
     if (!rows.length) {
       // Nothing to write isn't an error, but say why so an empty -o file (or an
       // empty pipe) isn't a mystery. The note goes to stderr, never the output.
       console.error(`No ${opts.status} results to export${opts.tag ? ` for tag '${opts.tag}'` : ''}.`);
+      // A chain with no approved run yet has plans and nothing else, which would
+      // otherwise read as "there is nothing here".
+      if (!opts.includePlans && tasks.some((t) => t.result != null && t.kind === 'plan')) {
+        console.error('  Only plan turns matched. Approve one (gemcatch approve <id>), or pass --include-plans.');
+      }
       return;
     }
 
@@ -632,6 +972,7 @@ program
           id: t.id,
           tag: t.tag,
           status: t.status,
+          kind: t.kind || 'task',
           prompt: t.prompt,
           result: t.result,
           created_at: t.created_at,
@@ -645,7 +986,8 @@ program
           const when = new Date(t.created_at).toISOString().replace('T', ' ').slice(0, 16);
           const head = (t.prompt || '(no prompt)').replace(/\s+/g, ' ').trim();
           const body = t.result && t.result.trim() ? t.result : '_(empty result)_';
-          return `## ${head}\n\n\`${t.id}\` · ${t.status} · ${when} UTC\n\n${body}`;
+          const kind = t.kind && t.kind !== 'task' ? ` · ${t.kind}` : '';
+          return `## ${head}\n\n\`${t.id}\` · ${t.status}${kind} · ${when} UTC\n\n${body}`;
         })
         .join('\n\n---\n\n');
     }
@@ -699,11 +1041,7 @@ program
       if (!opts.json) console.error(edim(`Digesting ${done.length} result(s) tagged ${opts.tag} -> task ${id}.`));
       await watchTask(store.getTask(id), DEFAULT_POLL_MS, opts.json);
     } catch (err) {
-      // Same rule as `research`: only a failed *submit* marks the task failed.
-      if (id) {
-        const t = store.getTask(id);
-        if (!t || !t.interaction_id) store.setStatus(id, 'failed', { error: err.message });
-      }
+      markSubmitFailure(id, err);
       die(err);
     }
   });
@@ -861,9 +1199,10 @@ async function watchTask(task, intervalMs, json) {
       last = r.status;
     }
     if (isSuccess(r.status)) {
-      emit(json, { id: task.id, status: r.status, result: r.text, citations: r.citations || null }, () =>
-        console.log(withSources(r.text, r.citations))
-      );
+      emit(json, resultPayload(task, r.status, r.text, r.citations), () => {
+        console.log(withSources(r.text, r.citations));
+        if (task.kind === 'plan') console.error(planFooter(task));
+      });
       return;
     }
     if (isDone(r.status)) {
@@ -891,9 +1230,10 @@ program
       // empty-text completion is served instead of re-polled (and lost at 24h).
       if (isSuccess(task.status) && task.result != null) {
         const cits = parseCitations(task.citations);
-        emit(opts.json, { id: task.id, status: task.status, result: task.result, citations: cits }, () =>
-          console.log(withSources(task.result, cits))
-        );
+        emit(opts.json, resultPayload(task, task.status, task.result, cits), () => {
+          console.log(withSources(task.result, cits));
+          if (task.kind === 'plan') console.error(planFooter(task));
+        });
         return;
       }
       if (opts.interval != null && (!Number.isFinite(opts.interval) || opts.interval <= 0)) {
@@ -983,20 +1323,37 @@ program
 program
   .command('stats')
   .option('--json', 'machine-readable output')
-  .description('where the store lives and what is in it')
+  .description('where the store lives, what is in it, and what the agent runs have plausibly cost')
   .action((opts) => {
     const rows = store.counts();
     const agents = store.agentCounts();
+    const kinds = store.kindCounts();
     const total = rows.reduce((n, r) => n + r.n, 0);
-    emit(opts.json, { db: store.DB_PATH, total, by_status: rows, by_agent: agents }, () => {
-      console.log(`Store: ${store.DB_PATH}`);
-      console.log(`Tasks: ${total}`);
-      for (const r of rows) console.log(`  ${colorStatus(r.status).padEnd(useColor ? 26 : 17)} ${r.n}`);
-      if (agents.length) {
-        console.log('Agent runs:');
-        for (const a of agents) console.log(`  ${a.agent.padEnd(34)} ${a.n}`);
+    const spend = estimatedSpend(agents);
+    emit(
+      opts.json,
+      { db: store.DB_PATH, total, by_status: rows, by_agent: agents, by_kind: kinds, estimated_spend: spend },
+      () => {
+        console.log(`Store: ${store.DB_PATH}`);
+        console.log(`Tasks: ${total}`);
+        for (const r of rows) console.log(`  ${colorStatus(r.status).padEnd(useColor ? 26 : 17)} ${r.n}`);
+        if (agents.length) {
+          console.log('Agent runs:');
+          for (const a of agents) console.log(`  ${a.agent.padEnd(34)} ${a.n}`);
+        }
+        if (kinds.length) {
+          console.log(`Plan chains: ${kinds.map((k) => `${k.n} ${k.kind}`).join(', ')}`);
+        }
+        if (spend) {
+          console.log(
+            `Estimated spend: $${spend.low.toFixed(2)}–$${spend.high.toFixed(2)} across ${spend.tasks} billed task(s)` +
+              ' (preview rates, subject to change' +
+              (spend.unpriced ? `; ${spend.unpriced} more on an agent with no published band` : '') +
+              ').'
+          );
+        }
       }
-    });
+    );
   });
 
 // Close the store on the way out so a one-shot command doesn't leave the

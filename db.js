@@ -31,6 +31,17 @@ const MIGRATIONS = [
   // the JSON array of sources an agent run returned alongside its report.
   ['agent', 'TEXT'],
   ['citations', 'TEXT'],
+  // 0.5.0: collaborative planning. `collaborative_planning` is the agent_config
+  // flag the row was submitted with (1 plan turn, 0 report turn, NULL for every
+  // run that sent no agent_config at all, including every pre-0.5.0 row);
+  // `previous_interaction_id` is the interaction this turn continues;
+  // `kind` is 'task' | 'plan' | 'report'; `parent_id` is the local task this
+  // turn continues. The DEFAULT backfills 'task' for older rows, so a 0.4.0
+  // store keeps behaving exactly as it did.
+  ['collaborative_planning', 'INTEGER'],
+  ['previous_interaction_id', 'TEXT'],
+  ['kind', "TEXT DEFAULT 'task'"],
+  ['parent_id', 'TEXT'],
 ];
 
 let _db = null;
@@ -64,8 +75,10 @@ function createTask(fields) {
   const now = Date.now();
   db()
     .prepare(
-      'INSERT INTO tasks (id, prompt, status, created_at, updated_at, model, system_instruction, tag, agent) ' +
-        'VALUES (@id, @prompt, @status, @now, @now, @model, @system_instruction, @tag, @agent)'
+      'INSERT INTO tasks (id, prompt, status, created_at, updated_at, model, system_instruction, tag, agent, ' +
+        'kind, parent_id, collaborative_planning, previous_interaction_id) ' +
+        'VALUES (@id, @prompt, @status, @now, @now, @model, @system_instruction, @tag, @agent, ' +
+        '@kind, @parent_id, @collaborative_planning, @previous_interaction_id)'
     )
     .run({
       id,
@@ -76,6 +89,12 @@ function createTask(fields) {
       system_instruction: t.systemInstruction || null,
       tag: t.tag || null,
       agent: t.agent || null,
+      kind: t.kind || 'task',
+      parent_id: t.parentId || null,
+      // Presence, not truthiness: `false` is the report turn's real flag and
+      // must be stored as 0, while a run that sends no agent_config stores NULL.
+      collaborative_planning: t.collaborativePlanning === undefined ? null : Number(!!t.collaborativePlanning),
+      previous_interaction_id: t.previousInteractionId || null,
     });
   return id;
 }
@@ -181,6 +200,15 @@ function agentCounts() {
     .all();
 }
 
+// Plan/report totals for `stats`. Ordinary tasks are not a row here; they are
+// already accounted for in counts(), and a store that has never planned reports
+// nothing at all.
+function kindCounts() {
+  return db()
+    .prepare("SELECT kind, COUNT(*) AS n FROM tasks WHERE kind IS NOT NULL AND kind != 'task' GROUP BY kind")
+    .all();
+}
+
 function close() {
   if (_db) _db.close();
   _db = null;
@@ -200,5 +228,6 @@ module.exports = {
   prunableTasks,
   counts,
   agentCounts,
+  kindCounts,
   close,
 };

@@ -30,6 +30,10 @@ const AGENT_CITATIONS = [
   { title: 'EU AI Act — EUR-Lex', url: 'https://eur-lex.europa.eu/eli/reg/2024/1689' },
   { title: 'UK AI regulation white paper', url: 'https://www.gov.uk/ai-regulation-pro-innovation' },
 ];
+// What a collaborative-planning turn comes back with: a plan, not a report.
+const PLAN_TEXT =
+  'Research plan:\n1. Map the EU AI Act high-risk articles and their dates.\n' +
+  '2. Map the UK regulator-led approach.\n3. Compare obligation by obligation.';
 // The mock accepts exactly the documented preview ids; anything else 4xxes,
 // like the real API would for a bad agent id.
 const KNOWN_AGENTS = new Set(['deep-research-preview-04-2026', 'deep-research-max-preview-04-2026']);
@@ -40,6 +44,7 @@ let getHits = 0;
 let keyRejects = 0;
 let flaky503s = 0;
 let agentRejects = 0;
+let prevRejects = 0;
 const interactions = new Map(); // id -> {status, pollsLeft, text, model, system, agent, deleted}
 
 // --- mock Interactions API ------------------------------------------------
@@ -74,6 +79,28 @@ const server = http.createServer((req, res) => {
         agentRejects += 1;
         return send(400, { error: { code: 400, message: `Unknown agent id: ${body.agent}.` } });
       }
+      // Collaborative planning is an agent_config field, not a top-level one,
+      // and the docs send the whole block with it. An ordinary run sends no
+      // agent_config at all, which is why its absence is not an error.
+      const cfg = body.agent_config;
+      if (cfg !== undefined) {
+        assert(body.agent, 'agent_config only applies to an agent run');
+        assert.strictEqual(cfg.type, 'deep-research', 'agent_config.type per the docs');
+        assert.strictEqual(cfg.thinking_summaries, 'auto', 'agent_config.thinking_summaries per the docs');
+        assert.strictEqual(typeof cfg.collaborative_planning, 'boolean', 'collaborative_planning is a boolean');
+      }
+      // A continuation names the interaction it follows. One the server can no
+      // longer resolve -- dropped after the retention window -- is a 404, which
+      // is exactly what an approve of an expired plan must not walk into.
+      if (body.previous_interaction_id !== undefined) {
+        assert(body.agent, 'a continuation is an agent run');
+        if (!interactions.has(body.previous_interaction_id)) {
+          prevRejects += 1;
+          return send(404, {
+            error: { code: 404, message: `Interaction ${body.previous_interaction_id} not found.` },
+          });
+        }
+      }
       const id = `int_${++seq}`;
       interactions.set(id, {
         status: 'in_progress',
@@ -92,6 +119,8 @@ const server = http.createServer((req, res) => {
         hardFailLeft: /HARDFAIL/.test(body.input) ? Infinity : /WATCHWEDGE/.test(body.input) ? 4 : 0,
         model: body.model,
         agent: body.agent,
+        planning: !!(cfg && cfg.collaborative_planning),
+        previousInteractionId: body.previous_interaction_id,
         // BUDGETPAUSE mimics a max_total_tokens cap being hit: the agent run
         // "safely pauses" and the interaction comes back status: incomplete.
         budgetPause: /BUDGETPAUSE/.test(body.input),
@@ -160,6 +189,24 @@ const server = http.createServer((req, res) => {
           ],
         });
       }
+      // A collaborative-planning turn returns the PLAN instead of a report --
+      // same step shape, no citations, nothing researched yet. A refine echoes
+      // its instruction so the chain can be proven to have reached the server.
+      if (it.planning) {
+        const revised = it.previousInteractionId ? `\n(revised: ${it.prompt})` : '';
+        return send(200, {
+          id: idPart,
+          agent: it.agent,
+          status: 'completed',
+          previous_interaction_id: it.previousInteractionId,
+          usage: { total_tokens: 120 },
+          steps: [
+            { type: 'user_input', content: [{ type: 'text', text: it.prompt }] },
+            { type: 'thought', signature: 'redacted' },
+            { type: 'model_output', content: [{ type: 'text', text: PLAN_TEXT + revised }] },
+          ],
+        });
+      }
       // An agent run is multi-step: plan and interim drafts first, the actual
       // report in the FINAL step (docs: interaction.steps[-1].content[0].text),
       // with citations attached. Only that final step's text is the answer.
@@ -167,6 +214,7 @@ const server = http.createServer((req, res) => {
         id: idPart,
         agent: it.agent,
         status: 'completed',
+        previous_interaction_id: it.previousInteractionId,
         usage: { total_tokens: 1234 },
         steps: [
           { type: 'user_input', content: [{ type: 'text', text: it.prompt }] },
@@ -292,6 +340,8 @@ function taskCount(home) {
   return qget(home, 'SELECT COUNT(*) AS n FROM tasks').n;
 }
 const idOf = (text) => (text.match(/^Task (\w+) submitted\./m) || [])[1];
+const planIdOf = (text) => (text.match(/^Plan task (\w+) submitted/m) || [])[1];
+const approveIdOf = (text) => (text.match(/^Task (\w+) submitted \(approves/m) || [])[1];
 const ok = (name) => console.log(`  ok  ${name}`);
 
 async function submit(prompt, args, extra) {
@@ -996,6 +1046,404 @@ async function submit(prompt, args, extra) {
   const axRow = qget(axEnv.GEMCATCH_HOME, 'SELECT status FROM tasks WHERE id = ?', axId);
   assert.strictEqual(axRow.status, 'incomplete', 'an expired agent interaction retires to incomplete');
   ok('an expired (404) agent interaction retires to incomplete exactly like a model one');
+
+  // ========================================================================
+  // Collaborative planning (0.5.0)
+  // ========================================================================
+
+  // ---- v0.4.0 -> 0.5.0 migration ----
+  // A store written by 0.4.0 (agent + citations, no plan-chain columns) must
+  // upgrade in place and then behave exactly as it did: every row preserved,
+  // kind backfilled to 'task' by the column default, the chain columns NULL,
+  // no KIND column in `list`, and a cached result still served from disk.
+  const v040 = path.join(HOME, 'v040');
+  fs.mkdirSync(v040, { recursive: true });
+  const v040Db = new Database(path.join(v040, 'tasks.db'));
+  v040Db.exec(
+    "CREATE TABLE tasks (id TEXT PRIMARY KEY, prompt TEXT, interaction_id TEXT, status TEXT DEFAULT 'pending', " +
+      'result TEXT, created_at INTEGER, model TEXT, system_instruction TEXT, tag TEXT, error TEXT, usage TEXT, ' +
+      'updated_at INTEGER, agent TEXT, citations TEXT)'
+  );
+  const insV040 = v040Db.prepare(
+    'INSERT INTO tasks (id, prompt, status, result, created_at, model, agent, citations) VALUES (?,?,?,?,?,?,?,?)'
+  );
+  insV040.run('pre05001', 'a 0.4.0 model row', 'completed', 'old answer', 100, 'gemini-3.5-flash-lite', null, null);
+  insV040.run(
+    'pre05002',
+    'a 0.4.0 agent row',
+    'completed',
+    'old report',
+    200,
+    null,
+    'deep-research-preview-04-2026',
+    JSON.stringify(AGENT_CITATIONS)
+  );
+  v040Db.close();
+  const v040Rows = JSON.parse(await out(['list', '--json'], { env: { GEMCATCH_HOME: v040 } }));
+  assert.strictEqual(v040Rows.length, 2, 'every 0.4.0 row survives the 0.5.0 migration');
+  for (const r of v040Rows) {
+    assert.strictEqual(r.kind, 'task', 'a pre-plan row reads back as kind task');
+    assert.strictEqual(r.parent_id, null, 'a pre-plan row has no parent');
+    assert.strictEqual(r.collaborative_planning, null, 'a pre-plan row sent no agent_config');
+    assert.strictEqual(r.previous_interaction_id, null, 'a pre-plan row continues nothing');
+  }
+  assert.strictEqual(v040Rows.find((r) => r.id === 'pre05001').result, 'old answer', 'results are untouched');
+  const v040List = await out(['list'], { env: { GEMCATCH_HOME: v040 } });
+  assert(!/KIND/.test(v040List), `a store with no plans keeps the layout it had: ${v040List}`);
+  assert(/AGENT/.test(v040List), 'the 0.4.0 AGENT column still appears');
+  const v040Get = await cli(['get', 'pre05001'], { env: { GEMCATCH_HOME: v040 } });
+  assert.strictEqual(v040Get.stdout.trim(), 'old answer', 'a 0.4.0 cached result still reads back');
+  assert.strictEqual(v040Get.stderr, '', 'and prints no plan chatter');
+  ok('a v0.4.0 tasks.db migrates to 0.5.0 preserving every row and behaving exactly as before');
+
+  // ---- --plan with --model (or with no agent at all) is rejected ----
+  const pmEnv = { GEMCATCH_HOME: path.join(HOME, 'plan-model') };
+  const pm = await cli(['research', 'x', '--plan', '--model', 'gemini-3.5-flash-lite'], { env: pmEnv }).catch((e) => e);
+  assert.strictEqual(pm.code, 1, '--plan with --model must be rejected');
+  assert(/--plan is a research-agent feature/.test(pm.stderr), `expected the agent-only message: ${pm.stderr}`);
+  const pmBare = await cli(['research', 'x', '--plan'], { env: pmEnv }).catch((e) => e);
+  assert.strictEqual(pmBare.code, 1, '--plan with no agent is the same mistake');
+  assert(/--plan is a research-agent feature/.test(pmBare.stderr), `bare --plan should explain: ${pmBare.stderr}`);
+  const pmBatch = await cli(['batch', '-', '--plan', '--model', 'gemini-3.5-flash-lite'], { env: pmEnv, stdin: 'q\n' }).catch((e) => e);
+  assert.strictEqual(pmBatch.code, 1, 'batch rejects it too');
+  assert.strictEqual(taskCount(pmEnv.GEMCATCH_HOME), 0, 'a rejected flag combination writes no rows');
+  ok('--plan without --agent (or with --model) is a clean error and nothing is submitted');
+
+  // ---- research --agent --plan --dry-run: the band, the honesty note, no submit ----
+  const pdEnv = { GEMCATCH_HOME: path.join(HOME, 'plan-dry') };
+  const pd = await out(['research', 'preview a plan', '--agent', 'deep-research', '--plan', '--dry-run'], { env: pdEnv });
+  assert(
+    /Agent deep-research-preview-04-2026 \(planning turn\) — estimated \$1\.00–\$3\.00 for this task \(the docs price per task and do not price a planning turn separately\)\. Nothing submitted \(--dry-run\)\./.test(pd),
+    `a planning dry-run quotes the SAME band and says the docs do not price planning separately: ${pd}`
+  );
+  assert(!/cheaper|less|discount/i.test(pd), 'the guard must never imply planning is cheaper');
+  assert.strictEqual(taskCount(pdEnv.GEMCATCH_HOME), 0, 'a planning dry-run submits nothing');
+  ok('research --agent --plan --dry-run prints the per-task band with the planning-turn note and submits nothing');
+
+  // ---- the whole chain: plan -> get -> refine -> approve, in one store ----
+  const chEnv = { GEMCATCH_HOME: path.join(HOME, 'chain') };
+  const chRun = await cli(
+    ['research', 'map the EU AI Act high-risk obligations against the UK approach', '--agent', 'deep-research', '--plan', '-t', 'euuk'],
+    { env: Object.assign({}, chEnv, { GEMCATCH_ASSUME_TTY: '1' }), stdin: 'y\n' }
+  );
+  const planId = planIdOf(chRun.stdout);
+  assert(planId, `--plan should submit a plan task: ${chRun.stdout}`);
+  assert(
+    /Agent deep-research-preview-04-2026 \(planning turn\) — estimated \$1\.00–\$3\.00 for this task \(preview rates, subject to change; the docs price per task and do not price a planning turn separately\)\./.test(chRun.stderr),
+    `the planning confirmation quotes the per-task band and refuses to imply a discount: ${chRun.stderr}`
+  );
+  assert(chRun.stdout.includes(`Run: gemcatch get ${planId} when ready.`), 'the next step is spelled out');
+  const planRow = qget(
+    chEnv.GEMCATCH_HOME,
+    'SELECT kind, agent, tag, collaborative_planning, parent_id, previous_interaction_id, interaction_id FROM tasks WHERE id = ?',
+    planId
+  );
+  assert.strictEqual(planRow.kind, 'plan', "the row is stored with kind='plan'");
+  assert.strictEqual(planRow.collaborative_planning, 1, 'and records the flag it was submitted with');
+  assert.strictEqual(planRow.parent_id, null, 'a first plan continues nothing');
+  assert.strictEqual(planRow.previous_interaction_id, null, 'and names no previous interaction');
+  const planWire = interactions.get(planRow.interaction_id);
+  assert.strictEqual(planWire.planning, true, 'agent_config.collaborative_planning reached the API as true');
+  assert.strictEqual(planWire.previousInteractionId, undefined, 'a first plan sends no previous_interaction_id');
+  ok('research --agent --plan submits a collaborative-planning turn and stores it as a plan');
+
+  // get on a completed plan prints the plan and the literal next command
+  await out(['get', planId], { env: chEnv }); // first poll: still in_progress
+  const planGet = await cli(['get', planId], { env: chEnv });
+  assert(planGet.stdout.includes('Research plan:'), `get should print the plan text: ${planGet.stdout}`);
+  assert(!planGet.stdout.includes(AGENT_ANSWER), 'a plan turn returns no report');
+  assert(
+    planGet.stderr.includes(`Approve with: gemcatch approve ${planId}`) &&
+      planGet.stderr.includes(`Refine with: gemcatch refine ${planId} "..."`),
+    `get on a plan names both next commands: ${planGet.stderr}`
+  );
+  assert(!planGet.stdout.includes('Approve with:'), 'the guidance stays off stdout so `get > plan.md` is clean');
+  const planJson = JSON.parse(await out(['get', planId, '--json'], { env: chEnv }));
+  assert.strictEqual(planJson.kind, 'plan', 'get --json marks a plan as one');
+  assert.strictEqual(planJson.approve, `gemcatch approve ${planId}`, 'and carries the approve command');
+  assert.strictEqual(planJson.refine, `gemcatch refine ${planId} "<instruction>"`, 'and the refine command');
+  ok('get on a completed plan prints the plan and then the approve/refine commands');
+
+  // refine: a second plan turn, linked to the first
+  const rfRun = await cli(['refine', planId, 'focus on enforcement dates, drop the history'], {
+    env: Object.assign({}, chEnv, { GEMCATCH_ASSUME_TTY: '1' }),
+    stdin: 'y\n',
+  });
+  const refineId = planIdOf(rfRun.stdout);
+  assert(refineId, `refine should submit a new plan task: ${rfRun.stdout}`);
+  assert(rfRun.stdout.includes(`(refines ${planId})`), 'and say what it refines');
+  assert(/\(planning turn\)/.test(rfRun.stderr), 'a refine is a planning turn and is priced as one');
+  const rfRow = qget(
+    chEnv.GEMCATCH_HOME,
+    'SELECT kind, agent, tag, collaborative_planning, parent_id, previous_interaction_id, interaction_id FROM tasks WHERE id = ?',
+    refineId
+  );
+  assert.strictEqual(rfRow.kind, 'plan', 'a refine stores another plan row');
+  assert.strictEqual(rfRow.parent_id, planId, 'linked to the plan it refines');
+  assert.strictEqual(rfRow.previous_interaction_id, planRow.interaction_id, "and to that plan's interaction");
+  assert.strictEqual(rfRow.agent, 'deep-research-preview-04-2026', 'the agent is inherited');
+  assert.strictEqual(rfRow.tag, 'euuk', 'and so is the tag');
+  const rfWire = interactions.get(rfRow.interaction_id);
+  assert.strictEqual(rfWire.planning, true, 'a refine keeps collaborative_planning true');
+  assert.strictEqual(rfWire.previousInteractionId, planRow.interaction_id, 'previous_interaction_id reached the API');
+  await out(['get', refineId], { env: chEnv }); // first poll
+  const rfGet = await out(['get', refineId], { env: chEnv });
+  assert(
+    rfGet.includes('(revised: focus on enforcement dates, drop the history)'),
+    `the refined plan reflects the instruction the server received: ${rfGet}`
+  );
+  ok('refine chains a second planning turn onto the first, inheriting agent and tag');
+
+  // approve: the report turn, priced without the planning note
+  const apRun = await cli(['approve', refineId], {
+    env: Object.assign({}, chEnv, { GEMCATCH_ASSUME_TTY: '1' }),
+    stdin: 'y\n',
+  });
+  const reportId = approveIdOf(apRun.stdout);
+  assert(reportId, `approve should submit the research run: ${apRun.stdout}`);
+  assert(apRun.stdout.includes(`(approves plan ${refineId})`), 'and say which plan it approves');
+  assert(
+    /Agent deep-research-preview-04-2026 — estimated \$1\.00–\$3\.00 for this task \(preview rates, subject to change\)\./.test(apRun.stderr),
+    `the approval turn quotes the ordinary band: ${apRun.stderr}`
+  );
+  assert(!/planning turn/.test(apRun.stderr), 'and is not a planning turn');
+  const rpRow = qget(
+    chEnv.GEMCATCH_HOME,
+    'SELECT kind, prompt, agent, tag, collaborative_planning, parent_id, previous_interaction_id, interaction_id FROM tasks WHERE id = ?',
+    reportId
+  );
+  assert.strictEqual(rpRow.kind, 'report', "an approved run is stored with kind='report'");
+  assert.strictEqual(rpRow.collaborative_planning, 0, 'and records collaborative_planning false');
+  assert.strictEqual(rpRow.parent_id, refineId, 'linked to the plan it approves');
+  assert.strictEqual(rpRow.previous_interaction_id, rfRow.interaction_id, "and to that plan's interaction");
+  assert.strictEqual(rpRow.tag, 'euuk', 'the tag follows the chain');
+  assert(
+    rpRow.prompt.startsWith('map the EU AI Act'),
+    `the report is filed under the question that started the chain, not the approval line: ${rpRow.prompt}`
+  );
+  const rpWire = interactions.get(rpRow.interaction_id);
+  assert.strictEqual(rpWire.planning, false, 'the approval turn sends collaborative_planning false');
+  assert.strictEqual(rpWire.previousInteractionId, rfRow.interaction_id, 'and continues the refined plan');
+  assert(/Plan looks good/.test(rpWire.prompt), 'the wire input is a short approval, not the question again');
+  await out(['get', reportId], { env: chEnv }); // first poll
+  const rpGet = await out(['get', reportId], { env: chEnv });
+  assert(rpGet.includes(AGENT_ANSWER), `an approved run returns the report: ${rpGet}`);
+  assert(rpGet.includes('Sources:'), 'with its citations');
+  ok('approve submits the research run with collaborative_planning false and returns the report');
+
+  // ---- list renders the chain indented under its root ----
+  const chList = await out(['list'], { env: chEnv });
+  assert(/KIND/.test(chList), `a store containing plans grows a KIND column: ${chList}`);
+  const chLines = chList.trim().split('\n');
+  const lineFor = (tid) => chLines.find((l) => l.startsWith(tid));
+  assert(lineFor(planId) && !/└─/.test(lineFor(planId)), 'the root of the chain is not indented');
+  assert(/└─ /.test(lineFor(refineId)), `a refine is indented under its plan: ${lineFor(refineId)}`);
+  assert(/ {2}└─ /.test(lineFor(reportId)), `the report is indented one deeper again: ${lineFor(reportId)}`);
+  assert(
+    chLines.indexOf(lineFor(planId)) < chLines.indexOf(lineFor(refineId)) &&
+      chLines.indexOf(lineFor(refineId)) < chLines.indexOf(lineFor(reportId)),
+    'a chain reads forward in time under its root'
+  );
+  assert(/\breport\b/.test(lineFor(reportId)) && /\bplan\b/.test(lineFor(planId)), 'the KIND column names each turn');
+  ok('list renders a plan chain indented under its root, in submission order');
+
+  // ---- list never loses a row, even to a parent_id cycle ----
+  // Nothing the CLI writes can make one, but a row unreachable from any root
+  // would otherwise vanish from the listing rather than crash.
+  const cyEnv = { GEMCATCH_HOME: path.join(HOME, 'cycle') };
+  fs.mkdirSync(cyEnv.GEMCATCH_HOME, { recursive: true });
+  const cyDb = new Database(path.join(cyEnv.GEMCATCH_HOME, 'tasks.db'));
+  cyDb.exec(
+    "CREATE TABLE tasks (id TEXT PRIMARY KEY, prompt TEXT, interaction_id TEXT, status TEXT DEFAULT 'pending', " +
+      'result TEXT, created_at INTEGER, model TEXT, system_instruction TEXT, tag TEXT, error TEXT, usage TEXT, ' +
+      "updated_at INTEGER, agent TEXT, citations TEXT, collaborative_planning INTEGER, " +
+      "previous_interaction_id TEXT, kind TEXT DEFAULT 'task', parent_id TEXT)"
+  );
+  const insCy = cyDb.prepare('INSERT INTO tasks (id, prompt, status, created_at, kind, parent_id) VALUES (?,?,?,?,?,?)');
+  insCy.run('cyc00001', 'points at the other one', 'completed', 100, 'plan', 'cyc00002');
+  insCy.run('cyc00002', 'points back at the first', 'completed', 200, 'plan', 'cyc00001');
+  insCy.run('cyc00003', 'an ordinary root', 'completed', 300, 'task', null);
+  cyDb.close();
+  const cyList = await out(['list'], { env: cyEnv });
+  for (const cid of ['cyc00001', 'cyc00002', 'cyc00003']) {
+    assert(cyList.includes(cid), `every row is still rendered exactly once: ${cid} missing from ${cyList}`);
+  }
+  assert.strictEqual((cyList.match(/cyc00001/g) || []).length, 1, 'and exactly once');
+  ok('list renders every row even when parent_id is unreachable from any root');
+
+  // ---- export follows the chain to the report and skips the plans ----
+  const chExport = await out(['export', '--tag', 'euuk'], { env: chEnv });
+  assert(chExport.includes(AGENT_ANSWER), `export emits the report: ${chExport}`);
+  assert(!chExport.includes('Research plan:'), 'and not the plan turns it went through');
+  assert(chExport.includes('## map the EU AI Act'), 'filed under the question that started the chain');
+  const chExportAll = await out(['export', '--tag', 'euuk', '--include-plans'], { env: chEnv });
+  assert(chExportAll.includes('Research plan:'), '--include-plans brings the plan turns back');
+  assert(chExportAll.includes(AGENT_ANSWER), 'alongside the report');
+  assert(/· plan ·/.test(chExportAll), 'and labels which turn each section was');
+  const chExportJson = JSON.parse(await out(['export', '--tag', 'euuk', '--format', 'json'], { env: chEnv }));
+  assert.strictEqual(chExportJson.length, 1, 'the json export is the report alone');
+  assert.strictEqual(chExportJson[0].kind, 'report', 'and says so');
+  ok('export follows a chain to its report and skips intermediate plans unless --include-plans');
+
+  // ---- approving the same plan twice makes a second report row ----
+  const ap2 = await cli(['approve', refineId, '--yes'], { env: chEnv });
+  const report2 = approveIdOf(ap2.stdout);
+  assert(report2 && report2 !== reportId, `a second approve is a second run, not a silent reuse: ${ap2.stdout}`);
+  const chReports = qall(chEnv.GEMCATCH_HOME, "SELECT id FROM tasks WHERE kind = 'report' AND parent_id = ?", refineId);
+  assert.strictEqual(chReports.length, 2, 'both report rows are stored');
+  const chList2 = await out(['list'], { env: chEnv });
+  assert(chList2.includes(reportId) && chList2.includes(report2), 'and list shows both');
+  ok('approving the same plan twice creates a second report row and list shows both');
+
+  // ---- stats tallies the chain and totals what it plausibly cost ----
+  // A chain bills per turn, so the running total has to count the plans too --
+  // that is the number a spend-guarded tool owes its user.
+  const chStats = JSON.parse(await out(['stats', '--json'], { env: chEnv }));
+  assert.deepStrictEqual(
+    chStats.by_kind.slice().sort((a, b) => a.kind.localeCompare(b.kind)),
+    [{ kind: 'plan', n: 2 }, { kind: 'report', n: 2 }],
+    `stats tallies plan and report turns: ${JSON.stringify(chStats.by_kind)}`
+  );
+  assert.strictEqual(chStats.estimated_spend.tasks, 4, 'every agent turn is billed, plans included');
+  assert.strictEqual(chStats.estimated_spend.low, 4, '4 turns at the $1.00 floor');
+  assert.strictEqual(chStats.estimated_spend.high, 12, 'and the $3.00 ceiling');
+  const chStatsHuman = await out(['stats'], { env: chEnv });
+  assert(/Plan chains: /.test(chStatsHuman), `the human view names the chain turns: ${chStatsHuman}`);
+  assert(
+    /Estimated spend: \$4\.00–\$12\.00 across 4 billed task\(s\) \(preview rates, subject to change\)\./.test(chStatsHuman),
+    `and totals them with the docs' hedge: ${chStatsHuman}`
+  );
+  const plainStats = await out(['stats'], { env: xpEnv });
+  assert(!/Plan chains|Estimated spend/.test(plainStats), `a store with no agent runs says neither: ${plainStats}`);
+  ok('stats tallies plan/report turns and totals the estimated spend across every billed turn');
+
+  // ---- approve --dry-run: the band, and nothing sent ----
+  const beforeDry = interactions.size;
+  const apDry = await out(['approve', refineId, '--dry-run'], { env: chEnv });
+  assert(
+    /Agent deep-research-preview-04-2026 — estimated \$1\.00–\$3\.00 for this task\. Nothing submitted \(--dry-run\)\./.test(apDry),
+    `approve --dry-run prints the band: ${apDry}`
+  );
+  assert.strictEqual(interactions.size, beforeDry, 'approve --dry-run sends nothing');
+  assert.strictEqual(
+    qall(chEnv.GEMCATCH_HOME, "SELECT id FROM tasks WHERE kind = 'report'").length,
+    2,
+    'and writes no row'
+  );
+  ok('approve --dry-run prints the band, sends nothing and writes nothing');
+
+  // ---- approve/refine in a non-TTY: --yes required, and honoured ----
+  const ntaEnv = { GEMCATCH_HOME: path.join(HOME, 'plan-notty') };
+  const nta = await cli(['research', 'scripted plan', '--agent', 'deep-research', '--plan', '--yes'], { env: ntaEnv });
+  const ntaPlan = planIdOf(nta.stdout);
+  await out(['get', ntaPlan], { env: ntaEnv });
+  await out(['get', ntaPlan], { env: ntaEnv }); // drive it to completed
+  const ntaRefused = await cli(['approve', ntaPlan], { env: ntaEnv }).catch((e) => e);
+  assert.strictEqual(ntaRefused.code, 1, 'approve in a non-TTY without --yes must refuse');
+  assert(/stdin is not a TTY/.test(ntaRefused.stderr) && /--yes/.test(ntaRefused.stderr), `the refusal names the fix: ${ntaRefused.stderr}`);
+  assert.strictEqual(
+    qall(ntaEnv.GEMCATCH_HOME, "SELECT id FROM tasks WHERE kind = 'report'").length,
+    0,
+    'a refused approve writes no row'
+  );
+  const ntaOk = await cli(['approve', ntaPlan, '--yes'], { env: ntaEnv });
+  assert(approveIdOf(ntaOk.stdout), `--yes confirms it in a script: ${ntaOk.stdout}`);
+  ok('approve refuses a non-TTY without --yes and honours --yes with it');
+
+  // ---- approve on a task that is not a plan: fails fast, sends nothing ----
+  const npEnv = { GEMCATCH_HOME: path.join(HOME, 'not-a-plan') };
+  const npId = await submit('an ordinary task', [], { env: npEnv });
+  const beforeNp = interactions.size;
+  const np = await cli(['approve', npId, '--yes'], { env: npEnv }).catch((e) => e);
+  assert.strictEqual(np.code, 1, 'approve on a non-plan exits non-zero');
+  assert(/is not a plan \(kind: task\)/.test(np.stderr), `the message says what it is: ${np.stderr}`);
+  assert(/--plan/.test(np.stderr), 'and how to make one');
+  assert.strictEqual(interactions.size, beforeNp, 'and nothing was submitted');
+  const npRefine = await cli(['refine', npId, 'do it differently', '--yes'], { env: npEnv }).catch((e) => e);
+  assert.strictEqual(npRefine.code, 1, 'refine is gated the same way');
+  assert(/is not a plan/.test(npRefine.stderr), `refine explains too: ${npRefine.stderr}`);
+  ok('approve (and refine) on a task that is not a plan fails fast and submits nothing');
+
+  // ---- approve on a plan that has not completed: fails fast, sends nothing ----
+  const ipEnv = { GEMCATCH_HOME: path.join(HOME, 'plan-pending') };
+  const ipRun = await cli(['research', 'SLOW plan still running', '--agent', 'deep-research', '--plan', '--yes'], { env: ipEnv });
+  const ipId = planIdOf(ipRun.stdout);
+  const beforeIp = interactions.size;
+  const ip = await cli(['approve', ipId, '--yes'], { env: ipEnv }).catch((e) => e);
+  assert.strictEqual(ip.code, 1, 'approve on an unfinished plan exits non-zero');
+  assert(/has not completed yet \(status: in_progress\)/.test(ip.stderr), `the message names the status: ${ip.stderr}`);
+  assert(new RegExp(`gemcatch watch ${ipId}`).test(ip.stderr), 'and how to wait for it');
+  assert.strictEqual(interactions.size, beforeIp, 'and nothing was submitted');
+  ok('approve on a plan that has not completed fails fast and submits nothing');
+
+  // ---- approve on a plan the server has already dropped ----
+  // Retired to `incomplete` by the 404 path: name the retention window rather
+  // than send a previous_interaction_id the server is going to reject.
+  const xpPlanEnv = { GEMCATCH_HOME: path.join(HOME, 'plan-expired') };
+  const xpRun = await cli(['research', 'SLOW plan that expires', '--agent', 'deep-research', '--plan', '--yes'], { env: xpPlanEnv });
+  const xpId = planIdOf(xpRun.stdout);
+  interactions.delete(qget(xpPlanEnv.GEMCATCH_HOME, 'SELECT interaction_id FROM tasks WHERE id = ?', xpId).interaction_id);
+  await cliTimeout(['daemon', '-i', '0.05', '--exit-when-idle', '--json'], { env: xpPlanEnv }, 15000);
+  assert.strictEqual(
+    qget(xpPlanEnv.GEMCATCH_HOME, 'SELECT status FROM tasks WHERE id = ?', xpId).status,
+    'incomplete',
+    'the 404 retires the plan exactly as it retires any other task'
+  );
+  const beforeXp = prevRejects;
+  const xp = await cli(['approve', xpId, '--yes'], { env: xpPlanEnv }).catch((e) => e);
+  assert.strictEqual(xp.code, 1, 'approving a dropped plan exits non-zero');
+  assert(/dropped server-side/.test(xp.stderr), `the message says what happened: ${xp.stderr}`);
+  assert(/1 day on the free tier \(55 days on paid\)/.test(xp.stderr), `and names the expiry: ${xp.stderr}`);
+  assert.strictEqual(prevRejects - beforeXp, 0, 'and no previous_interaction_id the server would reject was sent');
+  ok('approve on a plan whose interaction was dropped names the retention window and sends nothing');
+
+  // ---- a plan that expires only AFTER it completed locally ----
+  // gemcatch cannot know until the API says so, so the 404 it gets back is
+  // rewritten into the same explanation instead of a bare "not found".
+  const xlEnv = { GEMCATCH_HOME: path.join(HOME, 'plan-expired-late') };
+  const xlRun = await cli(['research', 'a plan that outlives its interaction', '--agent', 'deep-research', '--plan', '--yes'], { env: xlEnv });
+  const xlId = planIdOf(xlRun.stdout);
+  await out(['get', xlId], { env: xlEnv });
+  await out(['get', xlId], { env: xlEnv }); // completed and cached
+  interactions.delete(qget(xlEnv.GEMCATCH_HOME, 'SELECT interaction_id FROM tasks WHERE id = ?', xlId).interaction_id);
+  const beforeXl = prevRejects;
+  const xl = await cli(['approve', xlId, '--yes'], { env: xlEnv }).catch((e) => e);
+  assert.strictEqual(xl.code, 1, 'the API 404 surfaces as a failure');
+  assert(/gone server-side/.test(xl.stderr) && /55 days on paid/.test(xl.stderr), `the 404 is explained, not passed through raw: ${xl.stderr}`);
+  assert.strictEqual(prevRejects - beforeXl, 1, 'the API is what rejected it');
+  ok('a plan whose interaction expires after completion explains the 404 rather than passing it through');
+
+  // ---- batch --plan: a plan per prompt ----
+  const bpFile = path.join(HOME, 'plan-batch.txt');
+  fs.writeFileSync(bpFile, 'first plan question\nsecond plan question\n');
+  const bplEnv = { GEMCATCH_HOME: path.join(HOME, 'batch-plan') };
+  const bpl = await cli(['batch', bpFile, '--agent', 'deep-research', '--plan', '--yes', '-t', 'plans'], { env: bplEnv });
+  assert(
+    /2 prompts × deep-research-preview-04-2026 \(planning turn\) — estimated \$2\.00–\$6\.00 total \(preview rates, subject to change; the docs price per task and do not price a planning turn separately\)\./.test(bpl.stderr),
+    `a plan batch quotes N × the per-task band with the same honesty note: ${bpl.stderr}`
+  );
+  assert(/approve the ones worth running/.test(bpl.stdout), `and points at the approve step: ${bpl.stdout}`);
+  const bplRows = qall(bplEnv.GEMCATCH_HOME, 'SELECT kind, collaborative_planning, interaction_id FROM tasks');
+  assert.strictEqual(bplRows.length, 2, 'one plan row per prompt');
+  for (const r of bplRows) {
+    assert.strictEqual(r.kind, 'plan', 'every batch row is a plan');
+    assert.strictEqual(r.collaborative_planning, 1, 'submitted as a planning turn');
+    assert.strictEqual(interactions.get(r.interaction_id).planning, true, 'and the API got the flag');
+  }
+  ok('batch --agent --plan submits a planning turn per prompt and points at approve');
+
+  // ---- --plan with --watch: fine together, and the footer still appears ----
+  const pwEnv = { GEMCATCH_HOME: path.join(HOME, 'plan-watch') };
+  const pw = await cliTimeout(
+    ['research', 'SLOW watch a plan', '--agent', 'deep-research', '--plan', '--yes', '-w'],
+    { env: pwEnv },
+    20000
+  );
+  assert.strictEqual(pw.timedOut, false, '--plan and --watch work together');
+  assert.strictEqual(pw.code, 0, `a watched plan completes: ${pw.stderr}`);
+  assert(pw.stdout.includes('Research plan:'), `the plan lands on stdout: ${pw.stdout}`);
+  assert(/Approve with: gemcatch approve /.test(pw.stderr), `and the approve command on stderr: ${pw.stderr}`);
+  ok('research --plan --watch waits for the plan and still names the approve command');
 
   // ---- #3: the default SDK transport, exercised against a stubbed @google/genai.
   // Every test above forces GEMCATCH_FORCE_REST=1, so sdkInteractions() is
