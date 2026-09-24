@@ -2,10 +2,13 @@
 'use strict';
 
 const fs = require('fs');
+const path = require('path');
+const { pathToFileURL } = require('url');
 const crypto = require('crypto');
 const { Command, Option } = require('commander');
 const store = require('./db');
 const gemini = require('./gemini');
+const sources = require('./sources');
 const { TERMINAL, ACTIVE, PENDING, isDone, isSuccess } = require('./status');
 
 const DEFAULT_POLL_MS = Number(process.env.GEMCATCH_POLL_MS) || 10000;
@@ -90,28 +93,66 @@ function needTask(id) {
 }
 
 // Citations ride along with an agent's report -- the docs tell users to review
-// them to verify the sources, so they are printed under the result rather than
-// left in the database. A run without citations prints exactly as before.
-function withSources(text, citations) {
-  const body = text || '(empty response)';
-  if (!Array.isArray(citations) || !citations.length) return body;
-  const lines = citations.map((c, i) => {
-    const title = (c && (c.title || c.text)) || '';
-    const url = (c && (c.url || c.uri)) || '';
-    return `  [${i + 1}] ${[title, url].filter(Boolean).join(' — ') || JSON.stringify(c)}`;
-  });
-  return `${body}\n\nSources:\n${lines.join('\n')}`;
+// them to verify the sources -- so they are printed under the result, and so are
+// the paths of any charts it drew.
+function withSources(text, citations, images) {
+  const parts = [text || '(empty response)'];
+  if (Array.isArray(citations) && citations.length) {
+    const lines = citations.map((c, i) => {
+      const title = (c && (c.title || c.text)) || '';
+      const url = (c && (c.url || c.uri)) || '';
+      return `  [${i + 1}] ${[title, url].filter(Boolean).join(' — ') || JSON.stringify(c)}`;
+    });
+    parts.push(`Sources:\n${lines.join('\n')}`);
+  }
+  if (images && images.length) parts.push(`Images:\n${images.map((p) => `  ${p}`).join('\n')}`);
+  return parts.join('\n\n');
 }
 
-// The citations column holds JSON (or NULL). Parsed defensively: a corrupt row
-// degrades to "no sources", never a crash in the middle of printing a result.
-function parseCitations(raw) {
+// The citations and images_json columns hold JSON arrays (or NULL). Parsed
+// defensively: a corrupt row degrades to "none", never a crash in the middle of
+// printing a result.
+function parseList(raw) {
   if (!raw) return null;
   try {
     const v = JSON.parse(raw);
     return Array.isArray(v) && v.length ? v : null;
   } catch (_) {
     return null;
+  }
+}
+
+// --- images ---------------------------------------------------------------
+
+const IMAGE_DIR = path.join(store.HOME, 'images');
+function imageExt(mime) {
+  if (mime === 'image/jpeg') return '.jpg';
+  const sub = /^image\/([a-z0-9]+)/i.exec(mime || '');
+  return sub ? `.${sub[1].toLowerCase()}` : '.png';
+}
+
+// A --visualize run's charts arrive as base64 in the result, which the store
+// keeps as text only, so they are written out as <task-id>-<n>.<ext>. They can
+// chart private data, so they get the store's permissions.
+function saveImages(task, images) {
+  fs.mkdirSync(IMAGE_DIR, { recursive: true, mode: 0o700 });
+  return images.map((img, i) => {
+    const file = path.join(IMAGE_DIR, `${task.id}-${i + 1}${imageExt(img.mime_type)}`);
+    fs.writeFileSync(file, Buffer.from(img.data, 'base64'), { mode: 0o600 });
+    return file;
+  });
+}
+
+// Only files named for this task go: a digest lists its sources' images too,
+// and forgetting the digest must not take them with it.
+function removeImages(task) {
+  for (const p of parseList(task.images_json) || []) {
+    if (!path.basename(p).startsWith(`${task.id}-`)) continue;
+    try {
+      fs.rmSync(p, { force: true });
+    } catch (err) {
+      console.error(`Note: could not delete ${p} (${err.message}).`);
+    }
   }
 }
 
@@ -183,9 +224,11 @@ function estimatedSpend(agentRows) {
   return { low, high, tasks, unpriced };
 }
 
-// One sentence for a --dry-run: the band, the honesty note, and that nothing went.
-function dryRunSpend(agentId, count, planning) {
-  return `${spendLine(agentId, count, planning)}${spendNote(planning, false)}. Nothing submitted (--dry-run).`;
+// A --dry-run's lines: the sources it would have sent, then the band, the
+// honesty note and that nothing went, in the confirmation's order.
+function dryRunSpend(agentId, count, planning, src) {
+  const line = `${spendLine(agentId, count, planning)}${spendNote(planning, false)}. Nothing submitted (--dry-run).`;
+  return [...sources.describe(src), line].join('\n');
 }
 
 function askYesNo(question) {
@@ -202,7 +245,8 @@ function askYesNo(question) {
 // Returns only when the submission is confirmed; otherwise it exits (declined)
 // or throws (no way to ask). Runs BEFORE any row is written, so a declined or
 // refused submission leaves the tasks table untouched.
-async function confirmSpend(agentId, count, opts, planning) {
+async function confirmSpend(agentId, count, opts, planning, src) {
+  for (const line of sources.describe(src)) console.error(line);
   console.error(`${spendLine(agentId, count, planning)}${spendNote(planning, true)}.`);
   if (opts.yes) return;
   // GEMCATCH_ASSUME_TTY lets the offline suite drive the interactive branch
@@ -246,6 +290,80 @@ function resolveAgentOpts(opts, cmd) {
   return gemini.resolveAgent(opts.agent);
 }
 
+// --- sources --------------------------------------------------------------
+
+// --mcp, --file-search, --no-web, --attach and --visualize, on research and
+// batch alike. Each command gets its own MCP parsers: the modifier flags attach
+// to the --mcp before them, which only works if they share one list.
+function addSourceOptions(cmd) {
+  const mcp = sources.mcpOptionParsers();
+  const collect = (v, list) => (list || []).concat(v);
+  return cmd
+    .optionsGroup('Your own data (needs --agent):')
+    .option('--mcp <url>', 'let the agent call this remote MCP server (repeatable)', mcp.mcp)
+    .option('--mcp-name <name>', 'name for the --mcp before it (default: its host)', mcp.name)
+    .option('--mcp-header <header>', "'Name: value' header for the --mcp before it; ${VAR} reads the environment", mcp.header)
+    .option('--mcp-allow <tools>', 'comma-separated tools the --mcp before it may call', mcp.allow)
+    .option('--file-search <store>', 'let the agent search this File Search store (repeatable)', collect)
+    .option('--no-web', 'drop Google Search and URL Context; needs --mcp, --file-search or --attach')
+    .option('--attach <path|url>', 'attach a PDF, CSV or image to the first turn (repeatable)', collect)
+    .option('--visualize', 'let the agent draw charts; they are saved as image files');
+}
+
+// Reads the inline attachments and uploads the rest. Runs after the spend is
+// confirmed and before any row is written, so a failed upload costs nothing.
+// A plan is continued later, so it is told when its uploads expire.
+async function attachFiles(files, planning) {
+  const attached = await sources.materialize(files, gemini.upload, (a) => {
+    console.error(edim(`Uploading ${a.source} (${sources.size(a.bytes)}) to the Files API...`));
+  });
+  const expiry = Math.min(...attached.record.map((a) => a.expires_at || Infinity));
+  if (planning && expiry !== Infinity) {
+    const when = new Date(expiry).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+    console.error(`Note: the uploaded files expire at ${when}; a refine or approve after that will probably fail.`);
+  }
+  return attached;
+}
+
+// What a submitted turn records about its sources. Tools are stored with their
+// header values because a later turn of the chain has to send them again.
+function sourceColumns(src, record) {
+  return {
+    toolsJson: src.tools ? JSON.stringify(src.tools) : null,
+    attachmentsJson: record && record.length ? JSON.stringify(record) : null,
+    visualization: src.visualization || null,
+  };
+}
+
+// The source fields of a gemini.submit call, with ${VAR} header values filled in.
+function sourceArgs(src, items) {
+  return { tools: sources.withEnv(src.tools), attachments: items, visualization: src.visualization };
+}
+
+// The sources a later turn inherits from the row it continues. Attachments went
+// with the first turn and are already in the conversation, so none are resent.
+function storedSources(task) {
+  let tools;
+  try {
+    tools = task.tools_json ? JSON.parse(task.tools_json) : undefined;
+  } catch (_) {
+    throw new Error(`task ${task.id} has an unreadable tools_json column, so its tools can't be sent again`);
+  }
+  sources.withEnv(tools);
+  return { tools, files: [], visualization: task.visualization || undefined };
+}
+
+// Server text about a task can quote its MCP headers or attachment URLs back.
+function redactFor(task, text) {
+  const urls = (parseList(chainRoot(task).attachments_json) || []).filter((a) => a.via === 'url').map((a) => a.source);
+  return sources.redactText(text, parseList(task.tools_json), urls);
+}
+
+function maskRaw(raw, task) {
+  const shown = raw && raw.tools ? { ...raw, tools: sources.redactTools(raw.tools) } : raw;
+  return redactFor(task, JSON.stringify(shown, null, 2));
+}
+
 // --- plan chains ----------------------------------------------------------
 
 // `collaborative_planning: true` makes the agent return a research plan instead
@@ -275,14 +393,26 @@ function planFooter(task) {
 
 // The result payload for `get`/`watch`. The plan-chain fields ride along only on
 // a plan row, so a model run's --json shape is exactly what it always was.
-function resultPayload(task, status, result, citations) {
+function resultPayload(task, status, result, citations, images) {
   const p = { id: task.id, status, result, citations: citations || null };
+  if (images && images.length) p.images = images;
   if (task.kind === 'plan') {
     p.kind = 'plan';
     p.approve = `gemcatch approve ${task.id}`;
     p.refine = `gemcatch refine ${task.id} "<instruction>"`;
   }
   return p;
+}
+
+function cachedResult(task) {
+  return { status: task.status, text: task.result, citations: parseList(task.citations), imagePaths: parseList(task.images_json) };
+}
+
+function printResult(task, r, json) {
+  emit(json, resultPayload(task, r.status, r.text, r.citations, r.imagePaths), () => {
+    console.log(withSources(r.text, r.citations, r.imagePaths));
+    if (task.kind === 'plan') console.error(planFooter(task));
+  });
 }
 
 // Both continuation commands need the same thing: a plan row that completed and
@@ -345,10 +475,11 @@ function expiredHint(err, plan) {
   return e;
 }
 
-// A report row is displayed under the question that started the chain rather
-// than the "plan looks good" line actually sent -- that is what keeps `list` and
-// `export` reading as research instead of as protocol chatter.
-function rootPrompt(task) {
+// The first turn of a plan chain. A report row is displayed under the question
+// that started the chain rather than the "plan looks good" line actually sent --
+// that is what keeps `list` and `export` reading as research instead of as
+// protocol chatter.
+function chainRoot(task) {
   let cur = task;
   const seen = new Set([task.id]);
   while (cur.parent_id && !seen.has(cur.parent_id)) {
@@ -357,7 +488,7 @@ function rootPrompt(task) {
     if (!parent) break;
     cur = parent;
   }
-  return cur.prompt;
+  return cur;
 }
 
 // `refine` (another plan) and `approve` (the report) are the same submission --
@@ -368,6 +499,7 @@ function rootPrompt(task) {
 async function continuePlan(plan, opts, turn) {
   let id;
   try {
+    const src = storedSources(plan);
     if (opts.dryRun) {
       emit(
         opts.json,
@@ -378,12 +510,23 @@ async function continuePlan(plan, opts, turn) {
           parent_id: plan.id,
           previous_interaction_id: plan.interaction_id,
           input: turn.input,
+          ...sources.preview(src),
         },
-        () => console.log(dryRunSpend(plan.agent, 1, turn.planning))
+        () => console.log(dryRunSpend(plan.agent, 1, turn.planning, src))
       );
       return;
     }
-    await confirmSpend(plan.agent, 1, opts, turn.planning);
+    // Warned, not refused: whether the server still needs the files once the
+    // conversation has read them is not documented.
+    const expired = (parseList(chainRoot(plan).attachments_json) || []).filter(
+      (a) => a.expires_at && a.expires_at < Date.now()
+    );
+    if (expired.length) {
+      console.error(
+        `Note: ${expired.map((a) => a.source).join(', ')} expired from the Files API, so this turn will probably fail.`
+      );
+    }
+    await confirmSpend(plan.agent, 1, opts, turn.planning, src);
     id = store.createTask({
       prompt: turn.prompt,
       agent: plan.agent,
@@ -392,11 +535,13 @@ async function continuePlan(plan, opts, turn) {
       parentId: plan.id,
       collaborativePlanning: turn.planning,
       previousInteractionId: plan.interaction_id,
+      ...sourceColumns(src),
     });
     const r = await gemini.submit(turn.input, {
       agent: plan.agent,
       collaborativePlanning: turn.planning,
       previousInteractionId: plan.interaction_id,
+      ...sourceArgs(src),
     });
     store.setInteraction(id, r.interactionId, r.status);
     emit(
@@ -460,15 +605,27 @@ async function refresh(task) {
   }
   const extra = {};
   if (isDone(r.status)) {
+    if (r.text) r.text = redactFor(task, r.text);
     if (isSuccess(r.status)) {
       extra.result = r.text;
       // Agent runs return citations with the report; the docs tell users to
       // review them to verify the sources, so they are persisted, not dropped.
-      if (r.citations && r.citations.length) extra.citations = JSON.stringify(r.citations);
-    } else if (r.text) extra.error = r.text;
+      if (r.citations && r.citations.length) {
+        r.citations = JSON.parse(redactFor(task, JSON.stringify(r.citations)));
+        extra.citations = JSON.stringify(r.citations);
+      }
+      if (r.images.length) {
+        r.imagePaths = saveImages(task, r.images);
+        extra.images_json = JSON.stringify(r.imagePaths);
+      }
+    } else if (r.text) {
+      extra.error = r.text;
+    }
   }
   if (r.usage) extra.usage = JSON.stringify(r.usage);
   store.setStatus(task.id, r.status, extra);
+  // A digest has no images of its own but lists its sources' (see digest).
+  if (!r.imagePaths) r.imagePaths = parseList(task.images_json);
   return r;
 }
 
@@ -505,11 +662,13 @@ const program = new Command();
 program
   .name('gemcatch')
   .description("Fire-and-forget research tasks on Gemini's Interactions API (background execution).")
-  .version(require('./package.json').version);
+  .version(require('./package.json').version)
+  // An unknown `--flag=value` is echoed whole, and the value may be a token.
+  .configureOutput({ outputError: (str, write) => write(str.replace(/(unknown option '[^'=]*)=[^']*'/g, "$1=...'")) });
 
 // --- research -------------------------------------------------------------
 
-program
+const research = program
   .command('research')
   .argument('[prompt]', 'what you want researched; "-" reads stdin')
   .option('-f, --file <path>', 'read the prompt from a file')
@@ -521,12 +680,15 @@ program
   .option('-w, --watch', 'wait for the result instead of exiting')
   .option('--yes', 'confirm the agent cost without asking (required when stdin is not a TTY)')
   .option('--dry-run', 'show what would be submitted (and what it would cost); submit nothing')
-  .option('--json', 'machine-readable output')
+  .option('--json', 'machine-readable output');
+addSourceOptions(research)
   .description('submit a background task and exit immediately')
   .action(async (promptArg, opts, cmd) => {
     let id;
     try {
       const agent = resolveAgentOpts(opts, cmd);
+      const src = await sources.resolve(opts, agent);
+      for (const w of src.warnings) console.error(`Note: ${w}`);
       const prompt = await resolvePrompt(promptArg, opts);
       // undefined, not false: an ordinary run must keep sending no agent_config
       // at all, exactly as it did before collaborative planning existed.
@@ -534,15 +696,23 @@ program
       if (opts.dryRun) {
         emit(
           opts.json,
-          { dry_run: true, agent: agent || null, model: agent ? null : opts.model, plan: !!opts.plan, prompt },
+          {
+            dry_run: true,
+            agent: agent || null,
+            model: agent ? null : opts.model,
+            plan: !!opts.plan,
+            prompt,
+            ...sources.preview(src),
+          },
           () => {
-            if (agent) console.log(dryRunSpend(agent, 1, opts.plan));
+            if (agent) console.log(dryRunSpend(agent, 1, opts.plan, src));
             else console.log(`Would submit to ${opts.model}: ${snippet(prompt)}. Nothing submitted (--dry-run).`);
           }
         );
         return;
       }
-      if (agent) await confirmSpend(agent, 1, opts, opts.plan);
+      if (agent) await confirmSpend(agent, 1, opts, opts.plan, src);
+      const attached = await attachFiles(src.files, opts.plan);
       id = store.createTask({
         prompt,
         model: agent ? null : opts.model,
@@ -551,12 +721,14 @@ program
         tag: opts.tag,
         kind: opts.plan ? 'plan' : 'task',
         collaborativePlanning: planning,
+        ...sourceColumns(src, attached.record),
       });
       const r = await gemini.submit(prompt, {
         model: opts.model,
         agent,
         systemInstruction: opts.system,
         collaborativePlanning: planning,
+        ...sourceArgs(src, attached.items),
       });
       store.setInteraction(id, r.interactionId, r.status);
       if (opts.watch) {
@@ -649,7 +821,7 @@ async function watchBatch(tag, intervalMs, json) {
   );
 }
 
-program
+const batch = program
   .command('batch')
   .argument('<file>', 'prompts file — one per line, or "-" to read stdin')
   .option('-m, --model <id>', 'model to use', gemini.DEFAULT_MODEL)
@@ -661,11 +833,14 @@ program
   .option('-w, --watch', 'submit all, then poll until the whole batch finishes')
   .option('--yes', 'confirm the agent cost without asking (required when stdin is not a TTY)')
   .option('--dry-run', 'parse and list what would be submitted; submit nothing')
-  .option('--json', 'machine-readable output')
+  .option('--json', 'machine-readable output');
+addSourceOptions(batch)
   .description('submit many background tasks from a file, tagged as one batch')
   .action(async (file, opts, cmd) => {
     try {
       const agent = resolveAgentOpts(opts, cmd);
+      const src = await sources.resolve(opts, agent);
+      for (const w of src.warnings) console.error(`Note: ${w}`);
       const text = file === '-' ? await readStdin() : fs.readFileSync(file, 'utf8');
       const { prompts, skipped } = parsePrompts(text, opts.separator);
       if (!prompts.length) throw new Error(`no prompts found in ${file === '-' ? 'stdin' : file}`);
@@ -674,6 +849,7 @@ program
       if (skipped) {
         console.error(edim(`(skipped ${skipped} blank/comment line${skipped === 1 ? '' : 's'})`));
       }
+      if (prompts.length > 1) src.files = sources.uploadAll(src.files);
       // Auto-tag so the batch is collectable as a unit; a user tag wins.
       const tag = opts.tag || `batch-${crypto.randomUUID().slice(0, 6)}`;
 
@@ -681,10 +857,11 @@ program
       const planning = opts.plan ? true : undefined;
 
       if (opts.dryRun) {
-        emit(opts.json, { tag, dry_run: true, agent: agent || null, plan: !!opts.plan, prompts }, () => {
+        const payload = { tag, dry_run: true, agent: agent || null, plan: !!opts.plan, prompts, ...sources.preview(src) };
+        emit(opts.json, payload, () => {
           if (agent) {
             // The whole point of the guard: N × the per-task band, up front.
-            console.log(dryRunSpend(agent, prompts.length, opts.plan));
+            console.log(dryRunSpend(agent, prompts.length, opts.plan, src));
           } else {
             console.log(`Batch ${tag}: ${prompts.length} prompt(s) would be submitted:`);
             for (const p of prompts) console.log(`  ${snippet(p)}`);
@@ -695,7 +872,9 @@ program
 
       // An agent batch multiplies a per-task dollar band by the whole file, so
       // it is confirmed as one total before a single row is written.
-      if (agent) await confirmSpend(agent, prompts.length, opts, opts.plan);
+      if (agent) await confirmSpend(agent, prompts.length, opts, opts.plan, src);
+      // Uploaded once (see uploadAll) and attached to every prompt in the file.
+      const attached = await attachFiles(src.files, opts.plan);
 
       // One failed submit must not sink the batch: mark that task failed and
       // keep going. mapLimit preserves input order, so the report is stable.
@@ -708,6 +887,7 @@ program
           tag,
           kind: opts.plan ? 'plan' : 'task',
           collaborativePlanning: planning,
+          ...sourceColumns(src, attached.record),
         });
         try {
           const r = await gemini.submit(prompt, {
@@ -715,6 +895,7 @@ program
             agent,
             systemInstruction: opts.system,
             collaborativePlanning: planning,
+            ...sourceArgs(src, attached.items),
           });
           store.setInteraction(id, r.interactionId, r.status);
           return { id, interaction_id: r.interactionId, status: r.status, prompt };
@@ -794,21 +975,11 @@ program
       // result being *present*, not truthy: a task that completes with empty
       // text stores `''`, which is exactly the case the cache must still serve
       // -- re-polling it would 404 after 24h, the very thing we cache to avoid.
-      if (isSuccess(task.status) && task.result != null && !opts.raw) {
-        const cits = parseCitations(task.citations);
-        emit(opts.json, resultPayload(task, task.status, task.result, cits), () => {
-          console.log(withSources(task.result, cits));
-          if (task.kind === 'plan') console.error(planFooter(task));
-        });
-        return;
-      }
+      if (isSuccess(task.status) && task.result != null && !opts.raw) return printResult(task, cachedResult(task), opts.json);
       const r = await refresh(task);
-      if (opts.raw) return console.log(JSON.stringify(r.raw, null, 2));
+      if (opts.raw) return console.log(maskRaw(r.raw, task));
       if (isSuccess(r.status)) {
-        emit(opts.json, resultPayload(task, r.status, r.text, r.citations), () => {
-          console.log(withSources(r.text, r.citations));
-          if (task.kind === 'plan') console.error(planFooter(task));
-        });
+        printResult(task, r, opts.json);
       } else if (isDone(r.status)) {
         emit(opts.json, { id: task.id, status: r.status, error: r.text || null }, () =>
           console.log(`Task ${task.id}: ${colorStatus(r.status)}${r.text ? `\n${r.text}` : ''}`)
@@ -862,7 +1033,7 @@ program
       planning: false,
       kind: 'report',
       input: APPROVE_INPUT,
-      prompt: rootPrompt(plan),
+      prompt: chainRoot(plan).prompt,
       line: (newId) => `Task ${newId} submitted (approves plan ${plan.id}).`,
     });
   });
@@ -898,6 +1069,20 @@ function chainOrder(tasks) {
   return out;
 }
 
+// A word per kind of source a row used, for the list's SOURCES column.
+function sourcesUsed(t) {
+  const tools = parseList(t.tools_json) || [];
+  const files = parseList(t.attachments_json) || [];
+  const mcp = tools.filter((x) => x && x.type === 'mcp_server').length;
+  const words = [];
+  if (mcp) words.push(mcp > 1 ? `${mcp} mcp` : 'mcp');
+  if (tools.some((x) => x && x.type === 'file_search')) words.push('store');
+  if (tools.length && !tools.some((x) => x && x.type === 'google_search')) words.push('no-web');
+  if (files.length) words.push(files.length > 1 ? `${files.length} files` : 'file');
+  if (t.visualization) words.push('charts');
+  return words.join(',');
+}
+
 program
   .command('list')
   .alias('ls')
@@ -913,20 +1098,26 @@ program
       return die(new Error(`--limit must be a non-negative integer (got ${opts.limit})`));
     }
     const tasks = store.listTasks({ status: opts.status, tag: opts.tag, limit: opts.limit });
-    if (opts.json) return console.log(JSON.stringify(tasks, null, 2));
+    if (opts.json) {
+      const masked = tasks.map((t) => (t.tools_json ? { ...t, tools_json: sources.redactToolsJson(t.tools_json) } : t));
+      return console.log(JSON.stringify(masked, null, 2));
+    }
     if (!tasks.length) {
       console.log('No tasks yet. Submit one:  gemcatch research "your question"');
       return;
     }
-    // The AGENT and KIND columns only appear when something in the listing uses
-    // them, so a pure-model store keeps the compact four-column layout it always
-    // had. Agent ids are shown compact -- the "-preview-MM-YYYY" suffix is
-    // version noise in a table (the full id is in --json and in stats).
+    // The AGENT, KIND and SOURCES columns only appear when something in the
+    // listing uses them, so a pure-model store keeps the compact four-column
+    // layout it always had. Agent ids are shown compact -- the "-preview-MM-YYYY"
+    // suffix is version noise in a table (the full id is in --json and in stats).
     const showAgent = tasks.some((t) => t.agent);
     const showKind = tasks.some((t) => t.kind && t.kind !== 'task');
     const shortAgent = (a) => (a ? a.replace(/-preview-\d{2}-\d{4}$/, '') : '-');
+    const used = new Map(tasks.map((t) => [t.id, sourcesUsed(t)]));
+    const srcWidth = Math.max(...[...used.values()].map((u) => u.length));
+    const srcHead = srcWidth ? `${'SOURCES'.padEnd(Math.max(7, srcWidth))} ` : '';
     console.log(
-      dim(`ID        AGE   STATUS           ${showKind ? 'KIND    ' : ''}${showAgent ? 'AGENT              ' : ''}PROMPT`)
+      dim(`ID        AGE   STATUS           ${showKind ? 'KIND    ' : ''}${showAgent ? 'AGENT              ' : ''}${srcHead}PROMPT`)
     );
     for (const { task: t, depth } of chainOrder(tasks)) {
       const status = t.status || PENDING;
@@ -934,11 +1125,12 @@ program
       const pad = ' '.repeat(Math.max(0, 16 - status.length));
       const kindCol = showKind ? `${(t.kind || 'task').padEnd(7)} ` : '';
       const agentCol = showAgent ? `${shortAgent(t.agent).padEnd(18)} ` : '';
+      const srcCol = srcWidth ? `${(used.get(t.id) || '-').padEnd(Math.max(7, srcWidth))} ` : '';
       // Indent the prompt, not the id: the fixed-width columns stay aligned and
       // the chain still reads as one thing.
       const branch = depth ? `${'  '.repeat(depth - 1)}└─ ` : '';
       console.log(
-        `${t.id}  ${age(t.created_at).padEnd(4)}  ${colorStatus(status)}${pad} ${kindCol}${agentCol}${branch}${snippet(t.prompt)}`
+        `${t.id}  ${age(t.created_at).padEnd(4)}  ${colorStatus(status)}${pad} ${kindCol}${agentCol}${srcCol}${branch}${snippet(t.prompt)}`
       );
     }
   });
@@ -980,18 +1172,38 @@ program
       return;
     }
 
+    // Images go next to the export file so its links still resolve when the
+    // file is moved with them; on stdout they point into the data dir.
+    const exportImages = (t) =>
+      (parseList(t.images_json) || []).map((p) => {
+        if (!opts.out) return p;
+        const name = path.basename(p);
+        try {
+          fs.copyFileSync(p, path.join(path.dirname(path.resolve(opts.out)), name));
+          return name;
+        } catch (err) {
+          console.error(`Note: could not copy ${p} next to the export (${err.message}).`);
+          return p;
+        }
+      });
+
     let output;
     if (opts.format === 'json') {
       output = JSON.stringify(
-        rows.map((t) => ({
-          id: t.id,
-          tag: t.tag,
-          status: t.status,
-          kind: t.kind || 'task',
-          prompt: t.prompt,
-          result: t.result,
-          created_at: t.created_at,
-        })),
+        rows.map((t) => {
+          const row = {
+            id: t.id,
+            tag: t.tag,
+            status: t.status,
+            kind: t.kind || 'task',
+            prompt: t.prompt,
+            result: t.result,
+            created_at: t.created_at,
+          };
+          const images = exportImages(t);
+          if (images.length) row.images = images;
+          return row;
+        }),
         null,
         2
       );
@@ -1002,7 +1214,9 @@ program
           const head = (t.prompt || '(no prompt)').replace(/\s+/g, ' ').trim();
           const body = t.result && t.result.trim() ? t.result : '_(empty result)_';
           const kind = t.kind && t.kind !== 'task' ? ` · ${t.kind}` : '';
-          return `## ${head}\n\n\`${t.id}\` · ${t.status}${kind} · ${when} UTC\n\n${body}`;
+          const link = (p) => (path.isAbsolute(p) ? pathToFileURL(p).href : p);
+          const images = exportImages(t).map((p, i) => `\n\n![${t.id} image ${i + 1}](${link(p)})`);
+          return `## ${head}\n\n\`${t.id}\` · ${t.status}${kind} · ${when} UTC\n\n${body}${images.join('')}`;
         })
         .join('\n\n---\n\n');
     }
@@ -1041,16 +1255,24 @@ program
         );
       }
       done.reverse(); // oldest first, so the sources read in submission order
-      const sources = done
+      const results = done
         .map((t, i) => `## Source ${i + 1}: ${(t.prompt || '').replace(/\s+/g, ' ').trim()}\n\n${t.result}`)
         .join('\n\n');
       const prompt =
         `Synthesize the following ${done.length} research result(s) into one coherent summary.` +
         ' Note where they agree and disagree, and do not simply repeat each verbatim.\n\n' +
-        sources;
+        results;
       // The digest is itself a task, tagged so it is findable but kept out of
       // the source tag so a later digest never digests its own output.
-      id = store.createTask({ prompt, model: opts.model, systemInstruction: opts.system, tag: `${opts.tag}-digest` });
+      // A model can't carry the sources' charts forward, so the digest lists them.
+      const images = done.flatMap((t) => parseList(t.images_json) || []);
+      id = store.createTask({
+        prompt,
+        model: opts.model,
+        systemInstruction: opts.system,
+        tag: `${opts.tag}-digest`,
+        imagesJson: images.length ? JSON.stringify(images) : null,
+      });
       const r = await gemini.submit(prompt, { model: opts.model, systemInstruction: opts.system });
       store.setInteraction(id, r.interactionId, r.status);
       if (!opts.json) console.error(edim(`Digesting ${done.length} result(s) tagged ${opts.tag} -> task ${id}.`));
@@ -1213,13 +1435,7 @@ async function watchTask(task, intervalMs, json) {
       console.error(edim(`[${new Date().toISOString().slice(11, 19)}] ${task.id}: `) + ecolorStatus(r.status));
       last = r.status;
     }
-    if (isSuccess(r.status)) {
-      emit(json, resultPayload(task, r.status, r.text, r.citations), () => {
-        console.log(withSources(r.text, r.citations));
-        if (task.kind === 'plan') console.error(planFooter(task));
-      });
-      return;
-    }
+    if (isSuccess(r.status)) return printResult(task, r, json);
     if (isDone(r.status)) {
       emit(json, { id: task.id, status: r.status, error: r.text || null }, () => {
         console.error(`Task ${task.id} ended: ${ecolorStatus(r.status)}`);
@@ -1243,14 +1459,7 @@ program
     try {
       // Serve a completed result from cache -- present, not merely truthy, so an
       // empty-text completion is served instead of re-polled (and lost at 24h).
-      if (isSuccess(task.status) && task.result != null) {
-        const cits = parseCitations(task.citations);
-        emit(opts.json, resultPayload(task, task.status, task.result, cits), () => {
-          console.log(withSources(task.result, cits));
-          if (task.kind === 'plan') console.error(planFooter(task));
-        });
-        return;
-      }
+      if (isSuccess(task.status) && task.result != null) return printResult(task, cachedResult(task), opts.json);
       if (opts.interval != null && (!Number.isFinite(opts.interval) || opts.interval <= 0)) {
         return die(new Error(`--interval must be a positive number of seconds (got ${opts.interval})`));
       }
@@ -1299,7 +1508,10 @@ program
           console.error(edim(`  (remote delete failed for ${task.id}: ${err.message})`));
         }
       }
-      if (store.removeTask(task.id)) removed += 1;
+      if (store.removeTask(task.id)) {
+        removeImages(task);
+        removed += 1;
+      }
     }
     console.log(`Removed ${removed} task${removed === 1 ? '' : 's'}.`);
   });
@@ -1330,6 +1542,7 @@ program
       return;
     }
     const n = store.removeMany(doomed.map((t) => t.id));
+    for (const t of doomed) removeImages(t);
     console.log(`Pruned ${n} task${n === 1 ? '' : 's'}.`);
   });
 

@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-24
+
+### Added
+
+- **Research over your own data.** A Deep Research agent could only read the
+  public web through gemcatch, while the API has always let it read much more.
+  Five new flags on `research` and `batch` open that up, listed under their own
+  heading in `--help`. All of them need `--agent`; without it gemcatch exits
+  with one line naming the flag and writes nothing.
+
+  - `--attach <path|url>` (repeatable) gives the agent a PDF, CSV or image.
+    Local files go inline, in order, while the request stays under the API's
+    inline limit (100 MB, or 50 MB once a PDF is in it). The file that would
+    cross it, and every one after, is uploaded through the Files API and sent by
+    URI. Uploads expire after 48 hours, and a `--plan` run prints when. An https
+    URL is sent by reference, its query string masked everywhere but the wire,
+    and one without a supported extension is typed from a HEAD request (a
+    one-byte GET if HEAD is refused). Unknown types, missing and empty files are refused in one
+    line before the spend confirmation, with a hint to export Word files as PDF
+    and spreadsheets as CSV. A file that changes size between that check and
+    the send is refused too. A `batch` of more than one prompt uploads every
+    local file once instead of sending it inline with each prompt.
+  - `--mcp <url>` (repeatable) adds a remote MCP server, named after its host
+    unless `--mcp-name` says otherwise. `--mcp-header 'Name: value'` and
+    `--mcp-allow tool,tool` apply to the `--mcp` before them. Header values
+    and URL credentials are masked in the confirmation, `--dry-run`,
+    `list --json`, `get --raw` and API errors. A header value can read
+    `${VAR}` from the environment at send time, so the token never reaches
+    `tasks.db`; a value written out in full is kept there, since a later turn
+    has to resend it. On POSIX systems the data directory and the images
+    folder are now 0700, and `tasks.db` and each image 0600. A local or
+    private address, or credentials over plain http, get a warning.
+  - `--file-search <store>` (repeatable) lets the agent search File Search
+    stores, all in one `file_search` tool.
+  - `--no-web` drops Google Search and URL Context so the agent reads only what
+    you gave it. Code Execution stays, because it's how the agent works through a
+    CSV and draws a chart. It's refused when nothing else was given to read.
+  - `--visualize` sets `agent_config.visualization: "auto"`, alongside
+    `collaborative_planning` when `--plan` is also given. Charts in the final
+    report are written to the data directory's `images/` folder as
+    `<task-id>-<n>.<ext>`, recorded in the store, and listed under the report by
+    `get`, `watch` and `digest` and as `images` in `--json`. `export -o` copies
+    them next to the export and links them; `rm` and `prune` delete them.
+
+  Once a tool flag is given, the request lists Google Search, URL Context and
+  Code Execution alongside the new sources, because an explicit `tools` list
+  replaces the agent's defaults. `--attach` on its own sends no `tools` field.
+  `refine` and `approve` resend the plan's tools and visualization setting;
+  attachments go with the first turn only. `--dry-run` and the spend
+  confirmation list the sources above the cost, and `list` gains a SOURCES
+  column when a listed task used any of this.
+- An unknown `--flag=value` option is reported without its value, which could
+  be a token.
+- Additive schema migration: `tools_json`, `attachments_json`, `visualization`
+  and `images_json`, all nullable. A 0.5.0 `tasks.db` upgrades in place and
+  behaves exactly as it did.
+
+### Notes
+
+- A run with none of the new flags sends the same request body, byte for byte,
+  as 0.5.0 did, and a result without charts prints the same text.
+
 ## [0.5.0] - 2026-09-04
 
 ### Added
@@ -269,7 +331,8 @@ seen a task complete, the text is cached locally and survives that expiry — bu
 something has to poll inside that window for it to be seen at all, which is what
 `gemcatch daemon` exists to do.
 
-[Unreleased]: https://github.com/Booyaka101/gemcatch/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Booyaka101/gemcatch/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Booyaka101/gemcatch/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Booyaka101/gemcatch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Booyaka101/gemcatch/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Booyaka101/gemcatch/compare/v0.2.0...v0.3.0

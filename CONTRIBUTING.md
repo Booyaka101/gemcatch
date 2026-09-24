@@ -33,7 +33,8 @@ export GEMCATCH_HOME=/tmp/gemcatch-dev
 | `index.js` | CLI wiring, command actions, the daemon loop, output formatting. |
 | `gemini.js` | Everything that talks to the Interactions API: both transports, pacing, retries. |
 | `db.js` | SQLite store and schema migrations. |
-| `status.js` | The interaction lifecycle states, shared by the other three. |
+| `sources.js` | What an agent reads besides the prompt: the tool list, MCP headers and their masking, and the attachment plan (inline or upload). No API calls except the HEAD (or one-byte GET) that types an extensionless URL. |
+| `status.js` | The interaction lifecycle states, shared by the other modules. |
 | `test-offline.js` | The whole suite: mock API + real CLI as a subprocess. |
 
 ## Things worth knowing before you change the API layer
@@ -41,7 +42,7 @@ export GEMCATCH_HOME=/tmp/gemcatch-dev
 These are all load-bearing and were each learned the hard way:
 
 - **The API key goes in the `x-goog-api-key` header.** `Authorization: Bearer <key>` returns `401 ACCESS_TOKEN_TYPE_UNSUPPORTED` — that endpoint wants an OAuth2 token, not an API key.
-- **The prompt field is `input`, not `contents`.** It accepts a plain string.
+- **The prompt field is `input`, not `contents`.** It accepts a plain string, or a list of content blocks, which is how attachments travel: `[{type: 'text', text: prompt}, ...files]`. A run without attachments keeps sending the string.
 - **`output_text` is synthesised by the SDK.** Raw REST responses don't have it; the text has to be pulled out of `steps`. That's what `collectText` is for, and why the tests run through the REST path.
 - **The SDK's error `.message` is a useless stub** (`400 API error occurred: {"httpMeta":{...}}`). The real payload is on `.body` as a JSON string. `friendly()` unwraps it.
 - **Both transports funnel through `apiError()`** so guidance can't drift between them.
@@ -54,6 +55,10 @@ These are all load-bearing and were each learned the hard way:
 - **`collaborative_planning` is an `agent_config` field, not a top-level one**, and the docs send the whole block (`type`, `thinking_summaries`, `collaborative_planning`) with it. `agent_config` is optional otherwise, so `submit()` only builds it when a plan turn is involved — an ordinary run must keep making byte-for-byte the request it always made. The flag is checked for *presence*, not truthiness: `false` is the approval turn's real value and has to reach the API.
 - **The docs do not price a planning turn separately.** There is one band per task, full stop. Never print or imply that planning is cheaper — the value on offer is seeing the plan before committing to the run. `PLAN_NOTE` in `index.js` is the sentence that says so and it goes out with every planning quote.
 - **A plan chain is stored locally, not just referenced by id.** The Interactions API keeps interactions for 1 day on the free tier, so `previous_interaction_id` is a wasting asset: the chain lives in `parent_id`/`kind` in SQLite and the interaction id is only what the *next* turn needs. `approve` refuses a plan that has been retired to `incomplete` by the 404 path, and rewrites a live 404 into the same explanation, rather than sending an id the server will reject.
+- **An explicit `tools` list replaces the agent's defaults.** With no `tools` field the agent has Google Search, URL Context and Code Execution. So `buildTools()` returns `undefined` when no tool flag was given (a plain run must not grow a `tools` field), and lists the defaults back in when one was. `--no-web` removes the two web tools and keeps Code Execution, which never sends an empty list.
+- **MCP header values and URL credentials are secrets.** Anything that prints or stores text derived from a request or response goes through `redactTools()` or `redactText()` first, and that includes API errors, which can quote the request back. The one place they're kept in clear is `tools_json`, because a later turn has to resend them. A `${VAR}` header value is stored as written and expanded by `withEnv()` right before each send, so every path that submits tools must go through it. Shown URLs go through `shownUrl()`, which hides the user, password, query and fragment, so a signed `--attach` URL is stored masked too. Later text about a task goes through `redactFor()` in `index.js`, which masks any URL naming the same resource as a stored attachment.
+- **The inline limit is per request, not per file.** 100 MB of base64, or 50 MB once a PDF is inline. `planAttachments()` fills it in order and sends everything after the first file that doesn't fit through the Files API. It reads no file content, so a bad `--attach` fails before the spend confirmation, and `materialize()` refuses a file whose size changed since. It leaves 1 MB of headroom for the prompt, and a multi-prompt `batch` turns every inline file into an upload with `uploadAll()`, since inline bytes are resent per prompt.
+- **Uploads happen after the spend is confirmed and before the row is written.** A declined confirmation uploads nothing, and a failed upload leaves no row.
 
 ## Tests
 

@@ -46,6 +46,16 @@ let flaky503s = 0;
 let agentRejects = 0;
 let prevRejects = 0;
 const interactions = new Map(); // id -> {status, pollsLeft, text, model, system, agent, deleted}
+// Every create body exactly as it arrived, for the byte-level snapshots.
+const bodies = [];
+// The Files API side: upload sessions by path, finished files by name.
+const sessions = new Map();
+const uploads = new Map();
+let uploadSeq = 0;
+// A 1x1 PNG, the chart a --visualize run draws; the GIF is an interim draft's.
+const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+const GIF_B64 = 'R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==';
+const WEB_TOOLS = ['google_search', 'url_context', 'code_execution'];
 
 // --- mock Interactions API ------------------------------------------------
 
@@ -54,12 +64,67 @@ const server = http.createServer((req, res) => {
     res.writeHead(code, Object.assign({ 'Content-Type': 'application/json' }, headers || {}));
     res.end(body === undefined ? '' : JSON.stringify(body));
   };
+  // An upload session URL is pre-authorised, like Google's: no key on it.
+  // It takes every byte and finalizes in one request.
+  if (req.method === 'POST' && req.url.startsWith('/upload-session/')) {
+    let n = 0;
+    req.on('data', (c) => (n += c.length));
+    req.on('end', () => {
+      const s = sessions.get(req.url);
+      assert(s, 'upload to a session that was started');
+      assert.strictEqual(req.headers['x-goog-upload-command'], 'upload, finalize');
+      assert.strictEqual(req.headers['x-goog-upload-offset'], '0');
+      assert.strictEqual(n, s.size, 'every byte announced at start arrives');
+      const name = `files/f${++uploadSeq}`;
+      const file = {
+        name,
+        uri: `https://generativelanguage.googleapis.com/v1beta/${name}`,
+        mimeType: s.mime,
+        displayName: s.displayName,
+        sizeBytes: String(n),
+        // Real files sit in PROCESSING before they can be used.
+        state: 'PROCESSING',
+        broken: /BROKEN/.test(s.displayName),
+        expirationTime: new Date(Date.now() + 48 * 3600 * 1000).toISOString(),
+      };
+      uploads.set(name, file);
+      send(200, { file });
+    });
+    return;
+  }
   if (req.headers['x-goog-api-key'] !== 'TEST_KEY') {
     keyRejects += 1;
     return send(400, [{ error: { code: 400, message: 'API key not valid. Please pass a valid API key.' } }]);
   }
 
   const url = decodeURIComponent(req.url);
+
+  // Files API: start a resumable upload, then read the file back until ACTIVE.
+  if (req.method === 'POST' && url === '/upload/files') {
+    let raw = '';
+    req.on('data', (c) => (raw += c));
+    req.on('end', () => {
+      assert.strictEqual(req.headers['x-goog-upload-protocol'], 'resumable');
+      assert.strictEqual(req.headers['x-goog-upload-command'], 'start');
+      const session = `/upload-session/${++uploadSeq}`;
+      sessions.set(session, {
+        size: Number(req.headers['x-goog-upload-header-content-length']),
+        mime: req.headers['x-goog-upload-header-content-type'],
+        displayName: JSON.parse(raw).file.display_name,
+      });
+      send(200, {}, { 'x-goog-upload-url': `http://127.0.0.1:${server.address().port}${session}` });
+    });
+    return;
+  }
+  if (req.method === 'GET' && url.startsWith('/files/')) {
+    const file = uploads.get(url.slice(1));
+    if (!file) return send(404, { error: { code: 404, message: 'File not found.' } });
+    if (file.state === 'PROCESSING') file.state = file.broken ? 'FAILED' : 'ACTIVE';
+    const { broken: _b, ...shown } = file;
+    if (file.state === 'FAILED') shown.error = { code: 400, message: 'The document has no pages.' };
+    return send(200, shown);
+  }
+
   const idPart = url.replace('/interactions', '').replace(/^\//, '');
 
   // create
@@ -67,9 +132,48 @@ const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (c) => (raw += c));
     req.on('end', () => {
+      bodies.push(raw);
       const body = JSON.parse(raw);
       assert.strictEqual(body.background, true, 'background must be true');
-      assert.strictEqual(typeof body.input, 'string', 'input must be a plain string');
+      // A plain string, or (attachments) a text block followed by documents and
+      // images, each carrying inline data or a uri but never both.
+      const input = body.input;
+      if (typeof input !== 'string') {
+        assert(Array.isArray(input) && input.length > 1, 'input is a string or a text block plus attachments');
+        assert(body.agent, 'attachments ride on an agent run');
+        assert.strictEqual(input[0].type, 'text', 'the prompt comes first');
+        assert.strictEqual(typeof input[0].text, 'string');
+        for (const item of input.slice(1)) {
+          assert(item.type === 'document' || item.type === 'image', `attachment type: ${item.type}`);
+          assert.strictEqual(typeof item.mime_type, 'string', 'every attachment names its mime_type');
+          assert(!!item.data !== !!item.uri, 'exactly one of data or uri');
+          if (item.uri && item.uri.includes('/v1beta/files/')) {
+            const f = uploads.get(item.uri.split('/v1beta/')[1]);
+            assert(f && f.state === 'ACTIVE', 'an uploaded file is referenced only once ACTIVE');
+          }
+        }
+      }
+      const prompt = typeof input === 'string' ? input : input[0].text;
+      // An explicit tools list: known types only, MCP servers with a url and a
+      // name, allowed_tools as objects, File Search stores fully qualified.
+      if (body.tools !== undefined) {
+        assert(body.agent, 'tools apply to an agent run here');
+        assert(Array.isArray(body.tools) && body.tools.length, 'a tools list is never empty');
+        for (const t of body.tools) {
+          assert(WEB_TOOLS.concat('mcp_server', 'file_search').includes(t.type), `tool type: ${t.type}`);
+          if (t.type === 'mcp_server') {
+            assert(t.url && t.name, 'an MCP server has a url and a name');
+            if (t.allowed_tools) assert(t.allowed_tools.every((a) => Array.isArray(a.tools)), 'allowed_tools: [{tools}]');
+          }
+          if (t.type === 'file_search') {
+            assert(t.file_search_store_names.every((n) => n.startsWith('fileSearchStores/')), 'qualified store names');
+          }
+        }
+        // BADMCP: a 400 that quotes the request back, headers and all.
+        if (body.tools.some((t) => t.type === 'mcp_server' && /badmcp/.test(t.url))) {
+          return send(400, { error: { code: 400, message: `MCP server unreachable: ${JSON.stringify(body.tools)}` } });
+        }
+      }
       // `agent` replaces `model` on create; the two are mutually exclusive and
       // exactly one must be present. The CLI enforces this before submitting,
       // so the mock asserting it catches any regression that slips one through.
@@ -86,8 +190,12 @@ const server = http.createServer((req, res) => {
       if (cfg !== undefined) {
         assert(body.agent, 'agent_config only applies to an agent run');
         assert.strictEqual(cfg.type, 'deep-research', 'agent_config.type per the docs');
-        assert.strictEqual(cfg.thinking_summaries, 'auto', 'agent_config.thinking_summaries per the docs');
-        assert.strictEqual(typeof cfg.collaborative_planning, 'boolean', 'collaborative_planning is a boolean');
+        assert('collaborative_planning' in cfg || 'visualization' in cfg, 'agent_config is sent only to say something');
+        if ('collaborative_planning' in cfg) {
+          assert.strictEqual(cfg.thinking_summaries, 'auto', 'agent_config.thinking_summaries per the docs');
+          assert.strictEqual(typeof cfg.collaborative_planning, 'boolean', 'collaborative_planning is a boolean');
+        }
+        if ('visualization' in cfg) assert(['auto', 'off'].includes(cfg.visualization), 'visualization per the docs');
       }
       // A continuation names the interaction it follows. One the server can no
       // longer resolve -- dropped after the retention window -- is a 404, which
@@ -104,27 +212,33 @@ const server = http.createServer((req, res) => {
       const id = `int_${++seq}`;
       interactions.set(id, {
         status: 'in_progress',
-        prompt: body.input,
+        prompt,
         // SLOW stays in_progress for a couple of polls; FAIL/FLAKY/EMPTY and the
         // wedge cases resolve on the first successful one so both paths are
         // reachable in a single `get`.
-        pollsLeft: /SLOW/.test(body.input) ? 2 : /FAIL|FLAKY|EMPTY|WATCHWEDGE|HARDFAIL/.test(body.input) ? 0 : 1,
+        pollsLeft: /SLOW/.test(prompt) ? 2 : /FAIL|FLAKY|EMPTY|WATCHWEDGE|HARDFAIL/.test(prompt) ? 0 : 1,
         // FAIL and EMPTY both complete with no text; only FAIL is an error.
-        text: /FAIL|EMPTY/.test(body.input) ? '' : ANSWER,
-        fails: /FAIL/.test(body.input),
+        text: /FAIL|EMPTY/.test(prompt) ? '' : ANSWER,
+        fails: /FAIL/.test(prompt),
         // FLAKY answers the first two polls with a 503 before behaving.
-        flakyLeft: /FLAKY/.test(body.input) ? 2 : 0,
+        flakyLeft: /FLAKY/.test(prompt) ? 2 : 0,
         // WATCHWEDGE 500s a few times then recovers; HARDFAIL 500s forever. Both
         // drive the watch/daemon consecutive-failure safety bound.
-        hardFailLeft: /HARDFAIL/.test(body.input) ? Infinity : /WATCHWEDGE/.test(body.input) ? 4 : 0,
+        hardFailLeft: /HARDFAIL/.test(prompt) ? Infinity : /WATCHWEDGE/.test(prompt) ? 4 : 0,
         model: body.model,
         agent: body.agent,
         planning: !!(cfg && cfg.collaborative_planning),
         previousInteractionId: body.previous_interaction_id,
         // BUDGETPAUSE mimics a max_total_tokens cap being hit: the agent run
         // "safely pauses" and the interaction comes back status: incomplete.
-        budgetPause: /BUDGETPAUSE/.test(body.input),
+        budgetPause: /BUDGETPAUSE/.test(prompt),
         system: body.system_instruction,
+        // Echoed on every poll, as the real resource does, headers included.
+        tools: body.tools,
+        input: body.input,
+        // CHART: the report comes back with a chart, and a draft with another.
+        chart: /CHART/.test(prompt),
+        jpeg: /JPEGCHART/.test(prompt),
       });
       send(200, { id, status: 'in_progress' });
     });
@@ -173,6 +287,18 @@ const server = http.createServer((req, res) => {
       return send(200, { id: idPart, status: 'in_progress' });
     }
     if (it.status === 'cancelled') return send(200, { id: idPart, status: 'cancelled' });
+    if (it.fails && Array.isArray(it.input)) {
+      // A failed run over an attachment echoes the input and quotes the URL it couldn't read.
+      const uri = (it.input.find((i) => i.uri) || {}).uri;
+      return send(200, {
+        id: idPart,
+        status: 'failed',
+        steps: [
+          { type: 'user_input', content: it.input },
+          { type: 'model_output', content: [{ type: 'text', text: `Could not read ${uri}` }] },
+        ],
+      });
+    }
     if (it.fails) return send(200, { id: idPart, status: 'failed', usage: { total_tokens: 3 } });
     if (it.agent) {
       // A max_total_tokens budget pause: the run stops part-way and the
@@ -199,6 +325,7 @@ const server = http.createServer((req, res) => {
           agent: it.agent,
           status: 'completed',
           previous_interaction_id: it.previousInteractionId,
+          tools: it.tools,
           usage: { total_tokens: 120 },
           steps: [
             { type: 'user_input', content: [{ type: 'text', text: it.prompt }] },
@@ -210,17 +337,32 @@ const server = http.createServer((req, res) => {
       // An agent run is multi-step: plan and interim drafts first, the actual
       // report in the FINAL step (docs: interaction.steps[-1].content[0].text),
       // with citations attached. Only that final step's text is the answer.
+      const draft = [{ type: 'text', text: 'Interim: research plan drafted, 12 sources fetched.' }];
+      const report = [{ type: 'text', text: AGENT_ANSWER }];
+      let citations = AGENT_CITATIONS;
+      // CITEURI: the report quotes and cites the URL it was given.
+      const cited = /CITEURI/.test(it.prompt) && Array.isArray(it.input) && (it.input.find((i) => i.uri) || {}).uri;
+      if (cited) {
+        report[0].text += `
+From ${cited}.`;
+        citations = [...AGENT_CITATIONS, { title: 'The attachment', url: cited }];
+      }
+      if (it.chart) {
+        draft.push({ type: 'image', data: GIF_B64, mime_type: 'image/gif' });
+        report.push({ type: 'image', data: PNG_B64, mime_type: it.jpeg ? 'image/jpeg' : 'image/png' });
+      }
       return send(200, {
         id: idPart,
         agent: it.agent,
         status: 'completed',
         previous_interaction_id: it.previousInteractionId,
+        tools: it.tools,
         usage: { total_tokens: 1234 },
         steps: [
           { type: 'user_input', content: [{ type: 'text', text: it.prompt }] },
           { type: 'thought', signature: 'redacted' },
-          { type: 'model_output', content: [{ type: 'text', text: 'Interim: research plan drafted, 12 sources fetched.' }] },
-          { type: 'model_output', content: [{ type: 'text', text: AGENT_ANSWER }], citations: AGENT_CITATIONS },
+          { type: 'model_output', content: draft },
+          { type: 'model_output', content: report, citations },
         ],
       });
     }
@@ -253,6 +395,7 @@ function testEnv(extra) {
       GEMCATCH_BASE_URL: `http://127.0.0.1:${server.address().port}/interactions`,
       GEMINI_API_KEY: 'TEST_KEY',
       GEMCATCH_POLL_MS: '30',
+      GEMCATCH_UPLOAD_POLL_MS: '10',
       // The real default (15/min) would pace this suite to a crawl. The
       // limiter has its own test below, which switches it back on.
       GEMCATCH_RPM: '0',
@@ -1517,6 +1660,696 @@ async function submit(prompt, args, extra) {
   assert(/Approve with: gemcatch approve /.test(pw.stderr), `and the approve command on stderr: ${pw.stderr}`);
   ok('research --plan --watch waits for the plan and still names the approve command');
 
+  // ========================================================================
+  // Research over your own data (0.6.0)
+  // ========================================================================
+  {
+    const sources = require('./sources');
+    const promptOfBody = (b) => (typeof b.input === 'string' ? b.input : b.input[0].text);
+    // The last create body sent for this prompt, raw and parsed.
+    const sentFor = (prompt) => {
+      const hits = bodies.map((raw) => ({ raw, json: JSON.parse(raw) })).filter((b) => promptOfBody(b.json) === prompt);
+      assert(hits.length, `no request was sent for '${prompt}'`);
+      return hits[hits.length - 1];
+    };
+    const failOf = (args, extra) => cli(args, extra).then(
+      (r) => assert.fail(`expected a non-zero exit from ${args.join(' ')}: ${r.stdout}`),
+      (e) => e
+    );
+    const oneLine = (e) => {
+      assert.strictEqual(e.code, 1, `exit 1: ${e.stderr}`);
+      assert.strictEqual(e.stderr.trim().split('\n').length, 1, `exactly one line: ${e.stderr}`);
+      return e.stderr.trim();
+    };
+    const webTools = WEB_TOOLS.map((type) => ({ type }));
+
+    const files = path.join(HOME, 'files');
+    fs.mkdirSync(files, { recursive: true });
+    const csv = path.join(files, 'sales.csv');
+    fs.writeFileSync(csv, 'month,units\njan,10\nfeb,14\n');
+    const png = path.join(files, 'whiteboard.png');
+    fs.writeFileSync(png, Buffer.from(PNG_B64, 'base64'));
+    const b64 = (p) => fs.readFileSync(p).toString('base64');
+    // A file of exactly `size` bytes without writing them: only the size matters
+    // to the inline/upload split, and the upload path streams whatever is there.
+    const sized = (name, size) => {
+      const p = path.join(files, name);
+      fs.writeFileSync(p, '');
+      fs.truncateSync(p, size);
+      return p;
+    };
+
+    // ---- a plain run is byte-for-byte what 0.5.0 sent ----
+    const snapEnv = { GEMCATCH_HOME: path.join(HOME, 'snapshot'), GEMCATCH_MODEL: '' };
+    await cli(['research', 'plain model question'], { env: snapEnv });
+    await cli(['research', 'plain agent question', '--agent', 'deep-research', '--yes'], { env: snapEnv });
+    assert.strictEqual(
+      sentFor('plain model question').raw,
+      '{"model":"gemini-3.5-flash-lite","input":"plain model question","background":true}'
+    );
+    assert.strictEqual(
+      sentFor('plain agent question').raw,
+      '{"agent":"deep-research-preview-04-2026","input":"plain agent question","background":true}'
+    );
+    ok('snapshot: a plain model run and a plain agent run send exactly the 0.5.0 request body');
+
+    // ---- every source flag needs --agent, and says so in one line ----
+    const naEnv = { GEMCATCH_HOME: path.join(HOME, 'no-agent') };
+    const needsAgent = [
+      ['--mcp', 'https://mcp.example.com/mcp'],
+      ['--mcp-header', 'Authorization: Bearer SEKRIT-123'],
+      ['--mcp-allow', 'search'],
+      ['--mcp-name', 'crm'],
+      ['--file-search', 'my-store'],
+      ['--no-web'],
+      ['--attach', csv],
+      ['--visualize'],
+    ];
+    for (const flag of needsAgent) {
+      const e = await failOf(['research', 'a model question', ...flag], { env: naEnv });
+      const line = oneLine(e);
+      assert(line.startsWith(`Error: ${flag[0]} needs --agent`), `names the flag: ${line}`);
+      assert(!/SEKRIT/.test(e.stderr + e.stdout), 'a header value is never echoed');
+    }
+    const naBatch = await failOf(['batch', '-', '--visualize'], { env: naEnv, stdin: 'one\n' });
+    assert(oneLine(naBatch).startsWith('Error: --visualize needs --agent'), 'batch rejects it the same way');
+    assert.strictEqual(taskCount(naEnv.GEMCATCH_HOME), 0, 'a rejected flag writes nothing');
+    ok('--mcp, --mcp-*, --file-search, --no-web, --attach and --visualize without --agent: one line naming the flag');
+
+    // ---- each flag alone ----
+    const srcEnv = { GEMCATCH_HOME: path.join(HOME, 'sources') };
+    const agentRun = (prompt, ...args) => cli(['research', prompt, '--agent', 'deep-research', '--yes', ...args], { env: srcEnv });
+
+    await agentRun('mcp alone', '--mcp', 'https://mcp.example.com/mcp');
+    let sent = sentFor('mcp alone').json;
+    assert.deepStrictEqual(sent.tools, [...webTools, { type: 'mcp_server', name: 'mcp.example.com', url: 'https://mcp.example.com/mcp' }]);
+    assert.strictEqual(sent.input, 'mcp alone', 'no attachments, so input stays a string');
+    assert.strictEqual(sent.agent_config, undefined, 'no agent_config without --plan or --visualize');
+    ok('--mcp alone keeps the three default tools and adds the server, named after its host');
+
+    await agentRun('file search alone', '--file-search', 'my-store');
+    sent = sentFor('file search alone').json;
+    assert.deepStrictEqual(sent.tools, [
+      ...webTools,
+      { type: 'file_search', file_search_store_names: ['fileSearchStores/my-store'] },
+    ]);
+    ok('--file-search alone keeps the defaults and adds one file_search tool');
+
+    await agentRun('attach alone', '--attach', csv);
+    sent = sentFor('attach alone').json;
+    assert.strictEqual(sent.tools, undefined, 'an attachment is not a tool: no tools field');
+    assert.deepStrictEqual(sent.input, [
+      { type: 'text', text: 'attach alone' },
+      { type: 'document', data: b64(csv), mime_type: 'text/csv' },
+    ]);
+    await agentRun('attach a url', '--attach', 'https://example.com/q3/report.pdf');
+    assert.deepStrictEqual(sentFor('attach a url').json.input[1], {
+      type: 'document',
+      uri: 'https://example.com/q3/report.pdf',
+      mime_type: 'application/pdf',
+    });
+    ok('--attach alone: input becomes [text, ...items], a local file inline, an https URL by uri');
+
+    await agentRun('visualize alone', '--visualize');
+    sent = sentFor('visualize alone');
+    assert.strictEqual(
+      sent.raw,
+      '{"agent":"deep-research-preview-04-2026","input":"visualize alone","background":true,' +
+        '"agent_config":{"type":"deep-research","visualization":"auto"}}'
+    );
+    ok('--visualize alone sends agent_config {type, visualization: auto} and nothing else');
+
+    await agentRun('no web with mcp', '--no-web', '--mcp', 'https://mcp.example.com/mcp');
+    sent = sentFor('no web with mcp').json;
+    assert.deepStrictEqual(sent.tools, [
+      { type: 'code_execution' },
+      { type: 'mcp_server', name: 'mcp.example.com', url: 'https://mcp.example.com/mcp' },
+    ]);
+    await agentRun('no web with a file', '--no-web', '--attach', csv);
+    sent = sentFor('no web with a file').json;
+    assert.deepStrictEqual(sent.tools, [{ type: 'code_execution' }], 'the web tools go, code execution stays');
+    assert.strictEqual(sent.input.length, 2, 'and the file is attached');
+    const nwAlone = await failOf(['research', 'no web alone', '--agent', 'deep-research', '--yes', '--no-web'], { env: srcEnv });
+    assert(oneLine(nwAlone).startsWith('Error: --no-web leaves the agent nothing to read'), nwAlone.stderr);
+    ok('--no-web drops google_search and url_context, keeps code_execution, and is refused with nothing else to read');
+
+    // ---- everything at once, on a plan ----
+    const combo = [
+      'research', 'combined sources', '--agent', 'deep-research', '--plan', '--yes', '-t', 'combo',
+      '--mcp', 'https://tools.example.com/crm', '--mcp-name', 'crm',
+      '--mcp-header', 'Authorization: Bearer SEKRIT-123', '--mcp-header', 'X-Team: research',
+      '--mcp-allow', 'search,fetch', '--mcp-allow', 'list',
+      '--mcp', 'https://tools.example.com/wiki', '--mcp', 'https://tools.example.com/tickets',
+      '--file-search', 'handbook', '--file-search', 'fileSearchStores/contracts',
+      '--attach', csv, '--attach', png, '--visualize',
+    ];
+    const comboTools = [
+      ...webTools,
+      {
+        type: 'mcp_server',
+        name: 'crm',
+        url: 'https://tools.example.com/crm',
+        headers: { Authorization: 'Bearer SEKRIT-123', 'X-Team': 'research' },
+        allowed_tools: [{ tools: ['search', 'fetch', 'list'] }],
+      },
+      { type: 'mcp_server', name: 'tools.example.com', url: 'https://tools.example.com/wiki' },
+      { type: 'mcp_server', name: 'tools.example.com-2', url: 'https://tools.example.com/tickets' },
+      { type: 'file_search', file_search_store_names: ['fileSearchStores/handbook', 'fileSearchStores/contracts'] },
+    ];
+    const comboRun = await cli(combo, { env: srcEnv });
+    const comboId = planIdOf(comboRun.stdout);
+    sent = sentFor('combined sources').json;
+    assert.deepStrictEqual(sent, {
+      agent: 'deep-research-preview-04-2026',
+      input: [
+        { type: 'text', text: 'combined sources' },
+        { type: 'document', data: b64(csv), mime_type: 'text/csv' },
+        { type: 'image', data: b64(png), mime_type: 'image/png' },
+      ],
+      background: true,
+      tools: comboTools,
+      agent_config: { type: 'deep-research', thinking_summaries: 'auto', collaborative_planning: true, visualization: 'auto' },
+    });
+    const comboRow = qget(srcEnv.GEMCATCH_HOME, 'SELECT * FROM tasks WHERE id = ?', comboId);
+    assert.deepStrictEqual(JSON.parse(comboRow.attachments_json), [
+      { source: csv, type: 'document', mime_type: 'text/csv', via: 'inline', bytes: fs.statSync(csv).size },
+      { source: png, type: 'image', mime_type: 'image/png', via: 'inline', bytes: fs.statSync(png).size },
+    ]);
+    assert.strictEqual(comboRow.visualization, 'auto');
+    ok('all flags combined: one request with tools, [text, ...files] input, and planning plus visualization in one agent_config');
+
+    // ---- header values never reach a listing, a log or an error ----
+    assert(!/SEKRIT/.test(comboRun.stdout + comboRun.stderr), 'not in the submit output');
+    assert(/Authorization: \*\*\*/.test(comboRun.stderr), `the confirmation names the header, masked: ${comboRun.stderr}`);
+    const listed = await out(['list', '--json'], { env: srcEnv });
+    assert(!/SEKRIT/.test(listed), 'list --json masks header values');
+    const listedCombo = JSON.parse(listed).find((t) => t.id === comboId);
+    assert.strictEqual(JSON.parse(listedCombo.tools_json)[3].headers.Authorization, '***');
+    await out(['watch', comboId], { env: srcEnv });
+    const raw = await out(['get', comboId, '--raw'], { env: srcEnv });
+    assert(/"tools"/.test(raw) && !/SEKRIT/.test(raw), `get --raw masks the echoed tools: ${raw.slice(0, 200)}`);
+    const dry = await cli(combo.concat('--dry-run'), { env: srcEnv });
+    assert(!/SEKRIT/.test(dry.stdout + dry.stderr), 'dry-run masks header values');
+    assert(/Tools: google_search; url_context; code_execution; MCP crm https:\/\/tools.example.com\/crm \(Authorization: \*\*\*, X-Team: \*\*\*\) \[search, fetch, list\]/.test(dry.stdout), dry.stdout);
+    const dryJson = JSON.parse(await out(combo.concat('--dry-run', '--json'), { env: srcEnv }));
+    assert.deepStrictEqual(dryJson.tools[3].headers, { Authorization: '***', 'X-Team': '***' });
+    assert.deepStrictEqual(dryJson.attachments.map((a) => a.via), ['inline', 'inline']);
+    assert.strictEqual(dryJson.visualization, 'auto');
+    const badMcp = await failOf(
+      ['research', 'bad mcp', '--agent', 'deep-research', '--yes', '--mcp', 'https://badmcp.example.com/mcp',
+        '--mcp-header', 'Authorization: Bearer SEKRIT-123'],
+      { env: srcEnv }
+    );
+    assert(/MCP server unreachable/.test(badMcp.stderr) && /\*\*\*/.test(badMcp.stderr), badMcp.stderr);
+    assert(!/SEKRIT/.test(badMcp.stderr), 'an API error that quotes the request back is scrubbed');
+    const badRow = qall(srcEnv.GEMCATCH_HOME, "SELECT error FROM tasks WHERE prompt = 'bad mcp'")[0];
+    assert(badRow.error && !/SEKRIT/.test(badRow.error), 'and so is the error stored on the row');
+    ok('MCP header values are masked in the confirmation, dry-run, list --json, get --raw and API errors');
+
+    // ---- refine and approve reuse the plan's tools and visualization, not its files ----
+    const refined = await cli(['refine', comboId, 'narrow it to Q3', '--yes'], { env: srcEnv });
+    const refinedId = planIdOf(refined.stdout);
+    sent = sentFor('narrow it to Q3').json;
+    assert.deepStrictEqual(sent.tools, comboTools, 'refine resends the same tools');
+    assert.deepStrictEqual(sent.agent_config, {
+      type: 'deep-research', thinking_summaries: 'auto', collaborative_planning: true, visualization: 'auto',
+    });
+    assert.strictEqual(sent.input, 'narrow it to Q3', 'attachments go on the first turn only');
+    assert(/Authorization: \*\*\*/.test(refined.stderr) && !/SEKRIT/.test(refined.stderr), refined.stderr);
+    await out(['watch', refinedId], { env: srcEnv });
+    const approved = await cli(['approve', refinedId, '--yes'], { env: srcEnv });
+    const approvedId = approveIdOf(approved.stdout);
+    const approveIid = qget(srcEnv.GEMCATCH_HOME, 'SELECT interaction_id FROM tasks WHERE id = ?', refinedId).interaction_id;
+    sent = bodies.map((r) => JSON.parse(r)).filter((b) => b.previous_interaction_id === approveIid).pop();
+    assert.deepStrictEqual(sent.tools, comboTools, 'approve resends the same tools');
+    assert.strictEqual(sent.agent_config.collaborative_planning, false);
+    assert.strictEqual(sent.agent_config.visualization, 'auto', 'and keeps visualization');
+    assert.strictEqual(typeof sent.input, 'string');
+    for (const id of [refinedId, approvedId]) {
+      const row = qget(srcEnv.GEMCATCH_HOME, 'SELECT * FROM tasks WHERE id = ?', id);
+      assert.deepStrictEqual(JSON.parse(row.tools_json), comboTools, 'the turn records the tools it sent');
+      assert.strictEqual(row.visualization, 'auto');
+      assert.strictEqual(row.attachments_json, null, 'and attached nothing');
+    }
+    const approveDry = JSON.parse(await out(['approve', refinedId, '--dry-run', '--json'], { env: srcEnv }));
+    assert.strictEqual(approveDry.tools[3].headers.Authorization, '***', 'approve --dry-run shows the inherited tools, masked');
+    ok('refine and approve inherit the tools and visualization of the plan and send no attachments');
+
+    // ---- the inline/upload split at the cumulative limit ----
+    // base64 of n bytes is 4*ceil(n/3); the request limit is 100 MB, 50 MB once a
+    // PDF is in it, less the headroom, and a file goes inline only if the total fits.
+    const rawFor = (base64) => (base64 / 4) * 3;
+    const budget = sources.INLINE_LIMIT - sources.INLINE_HEADROOM;
+    const pdfBudget = sources.PDF_INLINE_LIMIT - sources.INLINE_HEADROOM;
+    const big = sized('big.csv', rawFor(budget)); // exactly the budget
+    const one = sized('one.csv', 1); // 4 more bytes of base64: over it
+    const late = sized('late.png', 1);
+    let plan = await sources.planAttachments([big, one, late]);
+    assert.deepStrictEqual(plan.map((a) => a.via), ['inline', 'upload', 'upload'], 'in order: the first to cross spills, and so does the rest');
+    plan = await sources.planAttachments([big, big, one]);
+    assert.deepStrictEqual(plan.map((a) => a.via), ['inline', 'upload'], 'a file given twice is attached once');
+    const pdfHalf = sized('half.pdf', rawFor(pdfBudget));
+    plan = await sources.planAttachments([pdfHalf, one]);
+    assert.deepStrictEqual(plan.map((a) => a.via), ['inline', 'upload'], 'with a PDF inline the limit is 50 MB');
+    const csvHalf = sized('half.csv', 37500000); // exactly 50,000,000 of base64
+    const tinyPdf = sized('tiny.pdf', 1);
+    plan = await sources.planAttachments([csvHalf, tinyPdf]);
+    assert.deepStrictEqual(plan.map((a) => a.via), ['inline', 'upload'], 'a PDF arriving late brings the 50 MB limit with it');
+    plan = await sources.planAttachments([csvHalf, one]);
+    assert.deepStrictEqual(plan.map((a) => a.via), ['inline', 'inline'], 'without a PDF 50 MB is well under the limit');
+    assert.deepStrictEqual(sources.uploadAll(plan).map((a) => a.via), ['upload', 'upload']);
+    ok('inline/upload split: cumulative base64 against 100 MB, or 50 MB with a PDF, in order, each file once');
+
+    const upEnv = { GEMCATCH_HOME: path.join(HOME, 'uploads') };
+    const bigPdf = sized('big.pdf', 37500000);
+    const up = await cli(
+      ['research', 'read these', '--agent', 'deep-research', '--yes', '--plan', '--attach', csv, '--attach', bigPdf, '--attach', late],
+      { env: upEnv }
+    );
+    assert.strictEqual(up.stderr.split('the uploaded files expire at').length - 1, 1, `a plan is told once when its uploads expire: ${up.stderr}`);
+    assert.strictEqual(up.stderr.split('Uploading ').length - 1, 2, 'one progress line per upload');
+    sent = sentFor('read these').json;
+    assert.deepStrictEqual(sent.input.map((i) => [i.type, i.mime_type, i.data ? 'data' : i.uri ? 'uri' : '-']), [
+      ['text', undefined, '-'],
+      ['document', 'text/csv', 'data'],
+      ['document', 'application/pdf', 'uri'],
+      ['image', 'image/png', 'uri'],
+    ]);
+    const uploadedPdf = uploads.get(sent.input[2].uri.split('/v1beta/')[1]);
+    assert.strictEqual(Number(uploadedPdf.sizeBytes), 37500000, 'the whole file was uploaded');
+    assert.strictEqual(uploadedPdf.displayName, 'big.pdf');
+    const upRow = qget(upEnv.GEMCATCH_HOME, "SELECT id, attachments_json FROM tasks WHERE prompt = 'read these'");
+    const upRec = JSON.parse(upRow.attachments_json);
+    assert.deepStrictEqual(upRec.map((a) => a.via), ['inline', 'upload', 'upload']);
+    assert(upRec[1].uri && upRec[1].expires_at > Date.now(), 'an upload records its uri and expiry');
+    ok('files over the limit go through the Files API, are referenced by uri, and a plan is told when they expire');
+
+    // An expired upload is warned about on a later turn, not refused.
+    const upDb = new Database(path.join(upEnv.GEMCATCH_HOME, 'tasks.db'));
+    upRec[1].expires_at = Date.now() - 1000;
+    upDb.prepare('UPDATE tasks SET attachments_json = ? WHERE id = ?').run(JSON.stringify(upRec), upRow.id);
+    upDb.close();
+    await out(['watch', upRow.id], { env: upEnv });
+    const lateRefine = await cli(['refine', upRow.id, 'and the appendix', '--yes'], { env: upEnv });
+    assert(/big\.pdf expired from the Files API/.test(lateRefine.stderr), lateRefine.stderr);
+    ok('a refine after an upload expired warns that it will probably fail');
+
+    const declineEnv = { GEMCATCH_HOME: path.join(HOME, 'upload-declined'), GEMCATCH_ASSUME_TTY: '1' };
+    const uploadsBefore = uploads.size;
+    const declined = await failOf(['research', 'declined upload', '--agent', 'deep-research', '--attach', bigPdf], {
+      env: declineEnv,
+      stdin: 'n\n',
+    });
+    assert(/Nothing submitted/.test(declined.stderr), `the decline is reported: ${declined.stderr}`);
+    assert.strictEqual(uploads.size, uploadsBefore, 'a declined confirmation uploads nothing');
+    assert.strictEqual(taskCount(declineEnv.GEMCATCH_HOME), 0, 'and writes nothing');
+    ok('declining the spend confirmation uploads nothing and writes nothing');
+
+    const brokenPdf = sized('BROKEN.pdf', 1);
+    const brokenEnv = { GEMCATCH_HOME: path.join(HOME, 'upload-broken') };
+    const broken = await failOf(
+      ['research', 'broken upload', '--agent', 'deep-research', '--yes', '--attach', bigPdf, '--attach', brokenPdf],
+      { env: brokenEnv }
+    );
+    assert(/upload of BROKEN\.pdf failed: The document has no pages\./.test(broken.stderr), broken.stderr);
+    assert.strictEqual(taskCount(brokenEnv.GEMCATCH_HOME), 0, 'a failed upload writes no row and submits nothing');
+    ok('a file the Files API marks FAILED stops the run before a row is written');
+
+    // ---- bad input, one line each, nothing written ----
+    const badEnv = { GEMCATCH_HOME: path.join(HOME, 'bad-sources') };
+    const notes = path.join(files, 'notes.txt');
+    fs.writeFileSync(notes, 'hello');
+    const sheet = path.join(files, 'sheet.xlsx');
+    fs.writeFileSync(sheet, 'PK');
+    const empty = path.join(files, 'empty.csv');
+    fs.writeFileSync(empty, '');
+    const badCases = [
+      [['--attach', notes], /unsupported file type '\.txt'; export it as PDF first; supported: \.pdf \.csv \.png/],
+      [['--attach', sheet], /unsupported file type '\.xlsx'; export it as CSV first/],
+      [['--attach', 'ftp://u:SEKRIT-pw@example.com/a.pdf?sig=SEKRIT-123'], /--attach ftp:\/\/\*\*\*:\*\*\*@example\.com\/a\.pdf\?\*\*\*: only local files/],
+      [['--attach', path.join(files, 'missing.pdf')], /missing\.pdf: no such file/],
+      [['--attach', files], /not a file/],
+      [['--attach', empty], /the file is empty/],
+      [['--attach', 'http://example.com/a.pdf'], /only local files and https URLs/],
+      [['--mcp-header', 'Authorization: Bearer SEKRIT-123', '--mcp', 'https://mcp.example.com'], /--mcp-header applies to the --mcp before it/],
+      [['--mcp', 'https://mcp.example.com', '--mcp-header', 'SEKRIT-123'], /--mcp-header needs 'Name: value'/],
+      [['--mcp', 'https://mcp.example.com', '--mcp-header', 'Bearer SEKRIT-123:x'], /--mcp-header needs 'Name: value' \(got no header name before a colon\)/],
+      [['--mcp', 'not a url'], /--mcp not a url: not a URL/],
+      [['--mcp', 'ftp://mcp.example.com'], /must be an http\(s\) URL/],
+      [['--mcp', 'ftp://u:SEKRIT-pw@mcp.example.com/?key=SEKRIT-123'], /--mcp ftp:\/\/\*\*\*:\*\*\*@mcp\.example\.com\/\?\*\*\*: must be an http\(s\) URL/],
+      [['--mcp', 'https://u:SEKRIT-pw@[bad/?key=SEKRIT-123'], /--mcp https:\/\/\*\*\*@\[bad\/\?\*\*\*: not a URL/],
+      [
+        ['--mcp', 'https://mcp.example.com', '--mcp-header', 'Authorization: Bearer ${GEMCATCH_TEST_UNSET}'],
+        /--mcp-header Authorization for mcp\.example\.com reads \$\{GEMCATCH_TEST_UNSET\}, which is not set/,
+      ],
+      [['--mcp-heade=Authorization: Bearer SEKRIT-123'], /unknown option '--mcp-heade=\.\.\.'/],
+      [['--mcp', 'https://a.example.com', '--mcp-name', 'crm', '--mcp', 'https://b.example.com', '--mcp-name', 'crm'], /--mcp-name crm is used twice/],
+      [
+        ['--mcp', 'https://mcp.example.com', '--mcp-header', 'Authorization: Bearer SEKRIT-123', '--mcp-header', 'authorization: SEKRIT-456'],
+        /--mcp-header authorization is given twice for one --mcp/,
+      ],
+      [['--mcp', 'https://mcp.example.com', '--mcp-allow', ' , '], /--mcp-allow for mcp\.example\.com lists no tools/],
+    ];
+    for (const [args, re] of badCases) {
+      const e = await failOf(['research', 'bad', '--agent', 'deep-research', '--yes', ...args], { env: badEnv });
+      assert(re.test(oneLine(e)), `${args.join(' ')}: ${e.stderr}`);
+      assert(!/SEKRIT/.test(e.stderr), 'no header value in an error');
+    }
+    assert.strictEqual(taskCount(badEnv.GEMCATCH_HOME), 0, 'no bad flag writes a row');
+    const local = await cli(
+      ['research', 'local mcp', '--agent', 'deep-research', '--dry-run', '--mcp', 'http://localhost:8080/mcp'],
+      { env: badEnv }
+    );
+    assert(/Note: --mcp http:\/\/localhost:8080\/mcp: Google's servers make this call/.test(local.stderr), local.stderr);
+    assert(!/plain http/.test(local.stderr), 'plain http with no credentials is not worth a warning');
+    const cleartext = await cli(
+      ['research', 'cleartext', '--agent', 'deep-research', '--dry-run', '--mcp', 'http://mcp.example.com/mcp', '--mcp-header', 'Authorization: Bearer SEKRIT-123'],
+      { env: badEnv }
+    );
+    assert(/Note: --mcp http:\/\/mcp\.example\.com\/mcp: plain http, so its credentials cross the network unencrypted/.test(cleartext.stderr), cleartext.stderr);
+    ok('unknown types, missing, empty and non-file attachments, bad URLs, bad headers and clashing names fail in one line');
+
+    // An explicit name is reserved before a host-derived one is picked.
+    const named = sources.buildTools(
+      [
+        { url: 'https://a.example.com/mcp', name: null, headers: [], allow: [] },
+        { url: 'https://b.example.com/mcp', name: 'a.example.com', headers: [], allow: [] },
+      ],
+      [],
+      true
+    );
+    assert.deepStrictEqual(named.slice(3).map((t) => t.name), ['a.example.com-2', 'a.example.com']);
+    // Credentials in the URL are masked wherever a URL is shown, and sent as given.
+    const keyed = await cli(
+      ['research', 'keyed', '--agent', 'deep-research', '--dry-run', '--mcp', 'http://localhost/mcp?token=SEKRIT-789'],
+      { env: badEnv }
+    );
+    assert(/mcp\?\*\*\*/.test(keyed.stdout + keyed.stderr) && !/SEKRIT/.test(keyed.stdout + keyed.stderr), keyed.stdout + keyed.stderr);
+    const keyedJson = JSON.parse(
+      await out(['research', 'keyed', '--agent', 'deep-research', '--dry-run', '--json', '--mcp', 'https://m.example.com/mcp?token=SEKRIT-789'], { env: badEnv })
+    );
+    assert.strictEqual(keyedJson.tools[3].url, 'https://m.example.com/mcp?***', 'the whole query is masked');
+    const keyTools = [{ type: 'mcp_server', url: 'https://m.example.com/mcp?token=SEKRIT-789', headers: { A: 'Bearer "SEKRIT"/1', B: '1' } }];
+    assert.strictEqual(
+      sources.redactText('echo {"A":"Bearer \\"SEKRIT\\"/1"} token=SEKRIT-789 page 1 of 10', keyTools),
+      'echo {"A":"***"} token=*** page 1 of 10',
+      'JSON-escaped values are scrubbed, and a short value is left alone rather than garbling the text'
+    );
+    const mcpAt = (url, headers) => [{ type: 'mcp_server', name: 'm', url, headers }];
+    assert.strictEqual(sources.shownUrl('https://TOKEN-SEKRIT-1@m.example.com/mcp'), 'https://***@m.example.com/mcp');
+    assert.strictEqual(sources.shownUrl('https://u:p%zz@m.example.com/mcp?a=1&flag#frag'), 'https://***:***@m.example.com/mcp?***#***');
+    assert.strictEqual(sources.shownUrl('https://m.example.com/mcp'), 'https://m.example.com/mcp', 'a URL with nothing to hide is shown as given');
+    const scrubbed = (text, tools, urls) => {
+      const r = sources.redactText(text, tools, urls);
+      assert(!/SEKRIT/.test(r), `scrubbed: ${r}`);
+      return r;
+    };
+    scrubbed('user TOKEN-SEKRIT-1 pw p%zzSEKRIT', mcpAt('https://TOKEN-SEKRIT-1:p%zzSEKRIT@m.example.com/'));
+    scrubbed('key SEKRIT-KEY-12 and SEKRIT abc def and SEKRIT-HASH-1', mcpAt('https://m.example.com/?SEKRIT-KEY-12&t=SEKRIT+abc+def#access_token=SEKRIT-HASH-1'));
+    assert.strictEqual(
+      scrubbed('401: token SEKRIT-TOKEN-99 rejected', mcpAt('https://m.example.com/', { Authorization: 'Bearer SEKRIT-TOKEN-99' })),
+      '401: token *** rejected',
+      'the credential in a Bearer value is scrubbed on its own'
+    );
+    assert.strictEqual(
+      scrubbed('saw SEKRIT-1234-LONGER', mcpAt('https://m.example.com/', { A: 'SEKRIT-1234', B: 'SEKRIT-1234-LONGER' })),
+      'saw ***',
+      'the longer value goes first, so none of it is left behind'
+    );
+    scrubbed('GET https://s3.example.com/x.pdf?X-Amz-Signature=SEKRIT-SIG-9 403', undefined, ['https://s3.example.com/x.pdf?X-Amz-Signature=SEKRIT-SIG-9']);
+    process.env.GEMCATCH_TEST_TOKEN = 'SEKRIT-ENV-42';
+    const envTools = mcpAt('https://m.example.com/', { Authorization: 'Bearer ${GEMCATCH_TEST_TOKEN}' });
+    assert.strictEqual(sources.withEnv(envTools)[0].headers.Authorization, 'Bearer SEKRIT-ENV-42');
+    assert.strictEqual(envTools[0].headers.Authorization, 'Bearer ${GEMCATCH_TEST_TOKEN}', 'the stored template is left as it was');
+    scrubbed('echo Bearer SEKRIT-ENV-42', envTools);
+    scrubbed('echo SEKRIT-ENV-42', mcpAt('https://m.example.com/', { Cookie: 'session=${GEMCATCH_TEST_TOKEN}; theme=dark' }));
+    delete process.env.GEMCATCH_TEST_TOKEN;
+    assert.strictEqual(
+      scrubbed('could not read https://s3.example.com/x.pdf?sig=SEKRIT-SIG-8, but https://other.example.com/x.pdf?page=2 is fine', undefined, ['https://s3.example.com/x.pdf?***']),
+      'could not read https://s3.example.com/x.pdf?***, but https://other.example.com/x.pdf?page=2 is fine',
+      'a stored, masked attachment URL masks the same resource in text and leaves other URLs alone'
+    );
+    assert.strictEqual(
+      scrubbed('{"text":"Source:\\n[HTTPS://s3.example.com/x.pdf?sig=SEKRIT-SIG-7]"}', undefined, ['https://s3.example.com/x.pdf?***']),
+      '{"text":"Source:\\n[https://s3.example.com/x.pdf?***]"}',
+      'after a JSON escape, in any case, and without eating markdown'
+    );
+    for (const u of [
+      'http://localhost/', 'http://api.localhost/', 'http://printer.local/', 'http://127.0.0.1/', 'http://2130706433/',
+      'http://10.1.2.3/', 'http://172.20.0.1/', 'http://192.168.1.1/', 'http://169.254.169.254/', 'http://100.64.0.1/',
+      'http://0.0.0.0/', 'http://[::1]/', 'http://[::]/', 'http://[fd00::1]/', 'http://[fe80::1]/',
+      'http://[::ffff:127.0.0.1]/', 'http://[::ffff:10.0.0.1]/',
+    ]) {
+      assert(sources.unreachableFromGoogle(u), `${u} is local`);
+    }
+    for (const u of [
+      'https://localhostify.com/', 'https://10.example.com/', 'https://mcp.example.com/', 'http://8.8.8.8/',
+      'http://[2001:db8::1]/', 'http://172.32.0.1/', 'http://100.128.0.1/', 'http://[::ffff:8.8.8.8]/',
+    ]) {
+      assert(!sources.unreachableFromGoogle(u), `${u} is not local`);
+    }
+    ok('MCP names clash only on purpose, URL credentials are masked, scrubbing leaves short values alone and covers URL users, key-only queries, fragments, Bearer credentials, attachment URLs and ${VAR} headers; local addresses are anchored');
+
+    // ---- an extensionless URL is typed from its Content-Type ----
+    const headWith = (type, status) => async (u, init) => {
+      assert.strictEqual(init.method, 'HEAD');
+      return { ok: (status || 200) < 400, status: status || 200, headers: new Map([['content-type', type]]) };
+    };
+    plan = await sources.planAttachments(['https://arxiv.org/pdf/1706.03762'], headWith('application/pdf'));
+    assert.deepStrictEqual(plan, [{ source: 'https://arxiv.org/pdf/1706.03762', type: 'document', mime_type: 'application/pdf', via: 'url' }]);
+    plan = await sources.planAttachments(['https://example.com/chart'], headWith('image/jpeg; charset=binary'));
+    assert.strictEqual(plan[0].type, 'image');
+    for (const [fetchImpl, re] of [
+      [headWith('text/html'), /can't tell its file type \(the server says text\/html\)/],
+      [headWith('application/pdf', 404), /HTTP 404/],
+      [async () => { throw new Error('getaddrinfo ENOTFOUND'); }, /could not reach it/],
+    ]) {
+      const e = await sources.planAttachments(['https://example.com/doc'], fetchImpl).catch((err) => err);
+      assert(re.test(e.message), e.message);
+      assert(!e.message.includes('\n'), 'one line');
+    }
+    const calls = [];
+    const noHead = async (u, init) => {
+      calls.push([init.method, init.headers && init.headers.Range]);
+      if (init.method === 'HEAD') return { ok: false, status: 405, headers: new Map() };
+      return { ok: true, status: 206, headers: new Map([['content-type', 'application/pdf']]) };
+    };
+    plan = await sources.planAttachments(['https://example.com/signed'], noHead);
+    assert.strictEqual(plan[0].mime_type, 'application/pdf');
+    assert.deepStrictEqual(calls, [['HEAD', undefined], ['GET', 'bytes=0-0']], 'a refused HEAD is retried as a one-byte GET');
+    const unreachable = await sources
+      .planAttachments(['https://u:SEKRIT-pw1@example.com/doc'], async (u) => {
+        throw new TypeError(`Request cannot be constructed from a URL that includes credentials: ${u}`);
+      })
+      .catch((err) => err);
+    assert(/could not reach it/.test(unreachable.message) && !/SEKRIT/.test(unreachable.message), unreachable.message);
+    const signed = await sources.planAttachments(['https://example.com/doc?sig=SEKRIT-SIG-1'], headWith('text/html', 404)).catch((err) => err);
+    assert(/--attach https:\/\/example\.com\/doc\?\*\*\*: can't tell its file type \(HTTP 404\)/.test(signed.message), signed.message);
+    ok('an https URL with no extension is typed by a HEAD request (a one-byte GET if HEAD is refused), refused when it is not a supported type, and masked in the error');
+
+    // ---- a signed attachment URL is sent as given and masked everywhere else ----
+    const signedUrl = 'https://example.com/q3/report.pdf?sig=SEKRIT-SIG-2';
+    const suDry = await cli(['research', 'signed url', '--agent', 'deep-research', '--dry-run', '--attach', signedUrl], { env: srcEnv });
+    assert(/report\.pdf\?\*\*\* \(url\)/.test(suDry.stdout) && !/SEKRIT/.test(suDry.stdout + suDry.stderr), suDry.stdout);
+    const suJson = JSON.parse(await out(['research', 'signed url', '--agent', 'deep-research', '--dry-run', '--json', '--attach', signedUrl], { env: srcEnv }));
+    assert.strictEqual(suJson.attachments[0].source, 'https://example.com/q3/report.pdf?***');
+    const suRun = await cli(['research', 'signed url', '--agent', 'deep-research', '--yes', '--attach', signedUrl], { env: srcEnv });
+    assert(!/SEKRIT/.test(suRun.stdout + suRun.stderr), suRun.stderr);
+    assert.strictEqual(sentFor('signed url').json.input[1].uri, signedUrl, 'the real URL goes on the wire');
+    const suRow = qget(srcEnv.GEMCATCH_HOME, "SELECT attachments_json FROM tasks WHERE prompt = 'signed url'");
+    assert(!/SEKRIT/.test(suRow.attachments_json) && /report\.pdf\?\*\*\*/.test(suRow.attachments_json), suRow.attachments_json);
+    const suFail = await cli(['research', 'signed FAIL', '--agent', 'deep-research', '--yes', '--attach', signedUrl], { env: srcEnv });
+    const suFailId = qget(srcEnv.GEMCATCH_HOME, "SELECT id FROM tasks WHERE prompt = 'signed FAIL'").id;
+    const suGot = await cli(['get', suFailId], { env: srcEnv }).catch((e) => e);
+    assert.strictEqual(suGot.code, 1, 'a failed task exits 1');
+    const suRaw = await cli(['get', suFailId, '--raw'], { env: srcEnv });
+    const suErr = qget(srcEnv.GEMCATCH_HOME, 'SELECT error FROM tasks WHERE id = ?', suFailId).error;
+    assert(/Could not read https:\/\/example\.com\/q3\/report\.pdf\?\*\*\*/.test(suErr), `the stored failure names the file, masked: ${suErr}`);
+    assert(/report\.pdf\?\*\*\*/.test(suRaw.stdout), suRaw.stdout);
+    assert(!/SEKRIT/.test(suFail.stdout + suFail.stderr + suGot.stdout + suGot.stderr + suRaw.stdout + suErr), suRaw.stdout);
+    const suCite = await cli(['research', 'signed CITEURI', '--agent', 'deep-research', '--yes', '-w', '--attach', signedUrl], { env: srcEnv });
+    const suCiteId = qget(srcEnv.GEMCATCH_HOME, "SELECT id FROM tasks WHERE prompt = 'signed CITEURI'").id;
+    const suCiteRow = qget(srcEnv.GEMCATCH_HOME, 'SELECT result, citations FROM tasks WHERE id = ?', suCiteId);
+    assert(/From https:\/\/example\.com\/q3\/report\.pdf\?\*\*\*\./.test(suCite.stdout), suCite.stdout);
+    assert(!/SEKRIT/.test(suCite.stdout + suCiteRow.result + suCiteRow.citations), suCiteRow.citations);
+    ok('a signed --attach URL goes on the wire as given and is masked in dry-run, JSON, the store, a report, its citations, a failure and --raw');
+
+    // ---- ${VAR} header values: the store holds the reference, the wire the value ----
+    const envEnv = { GEMCATCH_HOME: path.join(HOME, 'env-headers') };
+    const envArgs = ['--mcp', 'https://mcp.example.com/mcp', '--mcp-header', 'Authorization: Bearer ${GEMCATCH_CRM_TOKEN}'];
+    const envRun = await cli(['research', 'env header', '--agent', 'deep-research', '--plan', '--yes', ...envArgs], {
+      env: { ...envEnv, GEMCATCH_CRM_TOKEN: 'SEKRIT-ENV-77' },
+    });
+    const envPlanId = planIdOf(envRun.stdout);
+    assert.strictEqual(sentFor('env header').json.tools[3].headers.Authorization, 'Bearer SEKRIT-ENV-77');
+    const envRow = qget(envEnv.GEMCATCH_HOME, 'SELECT tools_json FROM tasks WHERE id = ?', envPlanId);
+    assert(envRow.tools_json.includes('Bearer ${GEMCATCH_CRM_TOKEN}') && !/SEKRIT/.test(envRow.tools_json), envRow.tools_json);
+    await out(['watch', envPlanId], { env: envEnv });
+    const bodiesBefore = bodies.length;
+    const noVar = await failOf(['refine', envPlanId, 'env refine', '--yes'], { env: envEnv });
+    assert(/reads \$\{GEMCATCH_CRM_TOKEN\}, which is not set/.test(oneLine(noVar)), noVar.stderr);
+    assert.strictEqual(bodies.length, bodiesBefore, 'nothing is sent without the variable');
+    assert.strictEqual(taskCount(envEnv.GEMCATCH_HOME), 1, 'and nothing is written');
+    await cli(['refine', envPlanId, 'env refine', '--yes'], { env: { ...envEnv, GEMCATCH_CRM_TOKEN: 'SEKRIT-ENV-78' } });
+    assert.strictEqual(sentFor('env refine').json.tools[3].headers.Authorization, 'Bearer SEKRIT-ENV-78', 'a later turn reads the variable again');
+    const envBad = await failOf(
+      ['research', 'env bad', '--agent', 'deep-research', '--yes', '--mcp', 'https://badmcp.example.com/mcp', '--mcp-header', 'Authorization: Bearer ${GEMCATCH_CRM_TOKEN}'],
+      { env: { ...envEnv, GEMCATCH_CRM_TOKEN: 'SEKRIT-ENV-79' } }
+    );
+    assert(/MCP server unreachable/.test(envBad.stderr) && !/SEKRIT/.test(envBad.stderr), envBad.stderr);
+    ok('${VAR} in an --mcp-header is read at send time, never stored, required on every turn, and scrubbed from errors');
+
+    // ---- a file that changes between planning and sending is refused ----
+    const growing = path.join(files, 'growing.csv');
+    fs.writeFileSync(growing, 'a,b\n');
+    const growPlan = await sources.planAttachments([growing]);
+    fs.appendFileSync(growing, '1,2\n');
+    for (const p of [growPlan, sources.uploadAll(growPlan)]) {
+      const e = await sources.materialize(p, async () => assert.fail('nothing is uploaded')).catch((err) => err);
+      assert(/growing\.csv: the file changed after it was checked/.test(e.message), e.message);
+    }
+    if (process.platform === 'win32') {
+      assert.strictEqual((await sources.planAttachments([csv, csv.toUpperCase()])).length, 1, 'Windows paths dedupe case-insensitively');
+    }
+    ok('a file that changed size after planning is refused before it is read or uploaded');
+
+    // ---- list shows a SOURCES column only when something used one ----
+    const srcList = await out(['list'], { env: srcEnv });
+    assert(/ SOURCES /.test(srcList.split('\n')[0]), srcList.split('\n')[0]);
+    const rowOf = (text, prompt) => text.split('\n').find((l) => l.includes(prompt)) || '';
+    assert(/ 3 mcp,store,2 files,charts +combined sources/.test(rowOf(srcList, 'combined sources')), rowOf(srcList, 'combined sources'));
+    assert(/ no-web,file +no web with a file/.test(rowOf(srcList, 'no web with a file')), rowOf(srcList, 'no web with a file'));
+    const snapList = await out(['list'], { env: snapEnv });
+    assert(!/SOURCES/.test(snapList), `a store with no sources has no SOURCES column: ${snapList}`);
+    ok('list shows a SOURCES column only when a listed task used one');
+
+    // ---- batch uploads the files once and attaches them to every prompt ----
+    const baEnv = { GEMCATCH_HOME: path.join(HOME, 'batch-attach') };
+    const baArgs = ['batch', '-', '--agent', 'deep-research', '--yes', '--attach', csv, '--mcp', 'https://mcp.example.com/mcp'];
+    const baDry = await cli([...baArgs, '--dry-run'], { env: baEnv, stdin: 'batch one\nbatch two\n' });
+    assert(/sales\.csv \(upload, /.test(baDry.stdout), `a batch plans its local files as uploads: ${baDry.stdout}`);
+    const baLines = baDry.stdout.trim().split('\n');
+    assert(baLines[0].startsWith('Tools: ') && /Nothing submitted/.test(baLines[baLines.length - 1]), `sources first, then the cost: ${baDry.stdout}`);
+    const uploadsBeforeBatch = uploads.size;
+    const baRun = await cli(baArgs, { env: baEnv, stdin: 'batch one\nbatch two\n' });
+    assert(!/expire at/.test(baRun.stderr), `no expiry note for a run that is not a plan: ${baRun.stderr}`);
+    const baConfirm = baRun.stderr.split('\n');
+    const [toolsAt, costAt] = [baConfirm.findIndex((l) => l.startsWith('Tools: ')), baConfirm.findIndex((l) => /estimated/.test(l))];
+    assert(toolsAt >= 0 && toolsAt < costAt, `the confirmation has the same order: ${baRun.stderr}`);
+    assert.strictEqual(uploads.size - uploadsBeforeBatch, 1, 'one upload for the whole batch');
+    const batchUris = new Set();
+    for (const p of ['batch one', 'batch two']) {
+      sent = sentFor(p).json;
+      assert.deepStrictEqual([sent.input[1].type, sent.input[1].mime_type, sent.input[1].data], ['document', 'text/csv', undefined]);
+      batchUris.add(sent.input[1].uri);
+      assert.strictEqual(sent.tools.length, 4);
+    }
+    assert.strictEqual(batchUris.size, 1, 'every prompt points at the same upload');
+    const soloEnv = { GEMCATCH_HOME: path.join(HOME, 'batch-solo') };
+    await cli(['batch', '-', '--agent', 'deep-research', '--yes', '--attach', csv], { env: soloEnv, stdin: 'batch solo\n' });
+    assert.deepStrictEqual(sentFor('batch solo').json.input[1], { type: 'document', data: b64(csv), mime_type: 'text/csv' }, 'a one-prompt batch still goes inline');
+    assert.strictEqual(
+      qall(baEnv.GEMCATCH_HOME, 'SELECT attachments_json FROM tasks').filter((r) => r.attachments_json).length,
+      2,
+      'every row records what it attached'
+    );
+    ok('batch uploads its local files once and sends the same attachments and tools with every prompt');
+
+    // ---- charts from --visualize are saved, listed, exported and digested ----
+    const imgEnv = { GEMCATCH_HOME: path.join(HOME, 'images') };
+    const imgRun = await cli(['research', 'CHART monthly units', '--agent', 'deep-research', '--visualize', '--yes', '-w', '-t', 'charts'], {
+      env: imgEnv,
+    });
+    const imgId = qget(imgEnv.GEMCATCH_HOME, "SELECT id FROM tasks WHERE prompt = 'CHART monthly units'").id;
+    const imgPath = path.join(imgEnv.GEMCATCH_HOME, 'images', `${imgId}-1.png`);
+    assert(imgRun.stdout.startsWith(AGENT_ANSWER), 'the report text comes first, unchanged');
+    assert(imgRun.stdout.includes(`\n\nImages:\n  ${imgPath}\n`), `the job output lists the image: ${imgRun.stdout}`);
+    assert.strictEqual(fs.readFileSync(imgPath).toString('base64'), PNG_B64, 'the image is written byte for byte');
+    assert.deepStrictEqual(fs.readdirSync(path.dirname(imgPath)), [`${imgId}-1.png`], "the interim draft's image is not saved");
+    const imgRow = qget(imgEnv.GEMCATCH_HOME, 'SELECT images_json FROM tasks WHERE id = ?', imgId);
+    assert.deepStrictEqual(JSON.parse(imgRow.images_json), [imgPath], 'the store records the path');
+    const imgGet = await out(['get', imgId], { env: imgEnv });
+    assert.strictEqual(imgGet, imgRun.stdout, 'the cached result lists it the same way');
+    const imgJson = JSON.parse(await out(['get', imgId, '--json'], { env: imgEnv }));
+    assert.deepStrictEqual(imgJson.images, [imgPath]);
+    const plainId = qget(srcEnv.GEMCATCH_HOME, "SELECT id FROM tasks WHERE prompt = 'mcp alone'").id;
+    const plainJson = JSON.parse(await out(['get', plainId, '--json'], { env: srcEnv }));
+    assert(!('images' in plainJson), 'a run without images has no images key');
+
+    const exportDir = path.join(HOME, 'export-out');
+    fs.mkdirSync(exportDir);
+    await cli(['export', '-t', 'charts', '-o', path.join(exportDir, 'report.md')], { env: imgEnv });
+    const md = fs.readFileSync(path.join(exportDir, 'report.md'), 'utf8');
+    assert(md.includes(`![${imgId} image 1](${imgId}-1.png)`), `export links the image: ${md}`);
+    assert.strictEqual(fs.readFileSync(path.join(exportDir, `${imgId}-1.png`)).toString('base64'), PNG_B64, 'and copies it next to the export');
+    const exJson = JSON.parse(await out(['export', '-t', 'charts', '--format', 'json'], { env: imgEnv }));
+    assert.deepStrictEqual(exJson[0].images, [imgPath], 'on stdout the export points into the data dir');
+    const exMd = await out(['export', '-t', 'charts'], { env: imgEnv });
+    assert(exMd.includes(`](${require('url').pathToFileURL(imgPath).href})`), `a markdown export on stdout links a file URL: ${exMd}`);
+
+    const dig = await cli(['digest', '-t', 'charts'], { env: imgEnv });
+    assert(dig.stdout.includes(`Images:\n  ${imgPath}`), `the digest lists the images it summarised: ${dig.stdout}`);
+    const digId = qget(imgEnv.GEMCATCH_HOME, "SELECT id FROM tasks WHERE tag = 'charts-digest'").id;
+    await cli(['rm', digId], { env: imgEnv });
+    assert(fs.existsSync(imgPath), "removing the digest leaves its sources' images alone");
+    // A file that can't be deleted is a note, not a failed rm.
+    const stuck = path.join(imgEnv.GEMCATCH_HOME, 'images', `${imgId}-2.png`);
+    fs.mkdirSync(stuck);
+    const imgDb = new Database(path.join(imgEnv.GEMCATCH_HOME, 'tasks.db'));
+    imgDb.prepare('UPDATE tasks SET images_json = ? WHERE id = ?').run(JSON.stringify([imgPath, stuck]), imgId);
+    imgDb.close();
+    const rmImg = await cli(['rm', imgId], { env: imgEnv });
+    assert(!fs.existsSync(imgPath), 'removing the task removes its images');
+    assert(/Note: could not delete .*-2\.png/.test(rmImg.stderr) && /Removed 1 task/.test(rmImg.stdout), rmImg.stderr + rmImg.stdout);
+    ok('--visualize charts are saved as <id>-<n>.png, listed in the output, the store, export and digest, and removed with the task');
+
+    await cli(['research', 'JPEGCHART units', '--agent', 'deep-research', '--visualize', '--yes', '-w'], { env: imgEnv });
+    const jpgRow = qget(imgEnv.GEMCATCH_HOME, "SELECT id, images_json FROM tasks WHERE prompt = 'JPEGCHART units'");
+    const jpgPath = JSON.parse(jpgRow.images_json)[0];
+    assert.strictEqual(path.basename(jpgPath), `${jpgRow.id}-1.jpg`, 'a JPEG chart is saved as .jpg');
+    if (process.platform !== 'win32') {
+      const mode = (p) => fs.statSync(p).mode & 0o777;
+      assert.strictEqual(mode(imgEnv.GEMCATCH_HOME), 0o700, 'the data directory is private');
+      assert.strictEqual(mode(path.join(imgEnv.GEMCATCH_HOME, 'tasks.db')), 0o600, 'and so is the store');
+      assert.strictEqual(mode(path.dirname(jpgPath)), 0o700, 'and the images directory');
+      assert.strictEqual(mode(jpgPath), 0o600, 'and each image');
+    }
+    const pruned = await cli(['prune', '--days', '0'], { env: imgEnv });
+    assert(/Pruned/.test(pruned.stdout) && !fs.existsSync(jpgPath), `prune deletes the images of what it prunes: ${pruned.stdout}`);
+    ok('a JPEG chart is saved as .jpg, the data directory, store and images are private on POSIX, and prune removes images');
+
+    // ---- a 0.5.0 store migrates in place ----
+    const v050 = path.join(HOME, 'v050');
+    fs.mkdirSync(v050, { recursive: true });
+    const v050Db = new Database(path.join(v050, 'tasks.db'));
+    v050Db.exec(
+      "CREATE TABLE tasks (id TEXT PRIMARY KEY, prompt TEXT, interaction_id TEXT, status TEXT DEFAULT 'pending', " +
+        'result TEXT, created_at INTEGER, model TEXT, system_instruction TEXT, tag TEXT, error TEXT, usage TEXT, ' +
+        "updated_at INTEGER, agent TEXT, citations TEXT, collaborative_planning INTEGER, previous_interaction_id TEXT, " +
+        "kind TEXT DEFAULT 'task', parent_id TEXT)"
+    );
+    v050Db
+      .prepare('INSERT INTO tasks (id, prompt, status, result, created_at, agent, kind, collaborative_planning, interaction_id) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run('pre06001', 'a 0.5.0 plan', 'completed', PLAN_TEXT, 100, 'deep-research-preview-04-2026', 'plan', 1, 'int_old_plan');
+    v050Db
+      .prepare('INSERT INTO tasks (id, prompt, status, result, created_at, model) VALUES (?,?,?,?,?,?)')
+      .run('pre06002', 'a 0.5.0 model row', 'completed', 'old answer', 200, 'gemini-3.5-flash-lite');
+    v050Db.close();
+    const v050Rows = JSON.parse(await out(['list', '--json'], { env: { GEMCATCH_HOME: v050 } }));
+    assert.strictEqual(v050Rows.length, 2, 'every 0.5.0 row survives');
+    for (const r of v050Rows) {
+      for (const col of ['tools_json', 'attachments_json', 'visualization', 'images_json']) {
+        assert.strictEqual(r[col], null, `${col} is NULL on an old row`);
+      }
+    }
+    assert.strictEqual((await out(['get', 'pre06002'], { env: { GEMCATCH_HOME: v050 } })).trim(), 'old answer');
+    const v050Dry = JSON.parse(await out(['approve', 'pre06001', '--dry-run', '--json'], { env: { GEMCATCH_HOME: v050 } }));
+    assert(!('tools' in v050Dry) && !('visualization' in v050Dry), 'an old plan continues with no tools field');
+    ok('a v0.5.0 tasks.db migrates to 0.6.0: new columns NULL, old rows behave as before');
+
+    for (const p of [big, one, late, pdfHalf, csvHalf, tinyPdf, bigPdf, brokenPdf]) fs.rmSync(p, { force: true });
+  }
+
   // ---- #3: the default SDK transport, exercised against a stubbed @google/genai.
   // Every test above forces GEMCATCH_FORCE_REST=1, so sdkInteractions() is
   // otherwise never covered. Inject a stub client and drive it directly. ----
@@ -1531,11 +2364,15 @@ async function submit(prompt, args, extra) {
         this.interactions = {
           create: async (body) => {
             assert.strictEqual(body.background, true, 'SDK submit must pass background:true');
-            assert.strictEqual(typeof body.input, 'string', 'SDK input must be a plain string');
+            assert(
+              typeof body.input === 'string' || (Array.isArray(body.input) && body.input[0].type === 'text'),
+              'SDK input is a plain string, or [text, ...attachments]'
+            );
             assert(!(body.agent && body.model), 'SDK submit must never send agent AND model');
             assert(body.agent || body.model, 'SDK submit must send one of agent or model');
             const id = `sdk_${++sdkSeq}`;
-            sdkState.set(id, { polls: /SLOW/.test(body.input) ? 1 : 0, boom: /BOOM/.test(body.input), agent: body.agent });
+            const prompt = typeof body.input === 'string' ? body.input : body.input[0].text;
+            sdkState.set(id, { polls: /SLOW/.test(prompt) ? 1 : 0, boom: /BOOM/.test(prompt), agent: body.agent, input: body.input });
             return { id, status: 'in_progress' };
           },
           get: async (id) => {
@@ -1572,8 +2409,22 @@ async function submit(prompt, args, extra) {
             return { id, status: 'completed', output_text: ANSWER, usage: { total_tokens: 7 } };
           },
         };
+        this.files = {
+          upload: async ({ file, config }) => {
+            assert.strictEqual(typeof file, 'string', 'the SDK is handed the path and streams it');
+            sdkUploads.push({ file, config });
+            return { name: 'files/sdk1', state: 'PROCESSING' };
+          },
+          get: async ({ name }) => ({
+            name,
+            state: 'ACTIVE',
+            uri: `https://generativelanguage.googleapis.com/v1beta/${name}`,
+            expirationTime: '2026-09-26T12:00:00Z',
+          }),
+        };
       }
     }
+    const sdkUploads = [];
     const saved = {
       key: process.env.GEMINI_API_KEY,
       force: process.env.GEMCATCH_FORCE_REST,
@@ -1582,6 +2433,7 @@ async function submit(prompt, args, extra) {
     process.env.GEMINI_API_KEY = 'TEST_KEY';
     delete process.env.GEMCATCH_FORCE_REST; // let the SDK path win over the fallback
     process.env.GEMCATCH_RPM = '0'; // no pacing for these in-process calls
+    process.env.GEMCATCH_UPLOAD_POLL_MS = '10';
     require.cache[genaiPath] = { id: genaiPath, filename: genaiPath, loaded: true, exports: { GoogleGenAI: StubGenAI } };
     delete require.cache[geminiPath]; // reload so sdkInteractions() memoizes the stub
     const sdk = require('./gemini');
@@ -1608,6 +2460,25 @@ async function submit(prompt, args, extra) {
     assert.strictEqual(sp.text, AGENT_ANSWER, 'the SDK agent run yields only the final-step report');
     assert.deepStrictEqual(sp.citations, AGENT_CITATIONS, 'citations survive the SDK path');
 
+    // The Files API through the SDK: path and mime handed over, PROCESSING
+    // waited out, and the uri and expiry read off the File it settles on.
+    const sdkFile = await sdk.upload(path.join(HOME, 'files', 'sales.csv'), 'text/csv');
+    assert.deepStrictEqual(sdkUploads, [
+      { file: path.join(HOME, 'files', 'sales.csv'), config: { mimeType: 'text/csv', displayName: 'sales.csv' } },
+    ]);
+    assert.deepStrictEqual(sdkFile, {
+      uri: 'https://generativelanguage.googleapis.com/v1beta/files/sdk1',
+      expiresAt: Date.parse('2026-09-26T12:00:00Z'),
+    });
+    const sf = await sdk.submit('with a file', {
+      agent: 'deep-research-preview-04-2026',
+      attachments: [{ type: 'document', uri: sdkFile.uri, mime_type: 'text/csv' }],
+    });
+    assert.deepStrictEqual(sdkState.get(sf.interactionId).input, [
+      { type: 'text', text: 'with a file' },
+      { type: 'document', uri: sdkFile.uri, mime_type: 'text/csv' },
+    ]);
+
     // Restore: nothing after this should see the stub or the fake key.
     delete require.cache[geminiPath];
     delete require.cache[genaiPath];
@@ -1617,7 +2488,8 @@ async function submit(prompt, args, extra) {
     else process.env.GEMCATCH_FORCE_REST = saved.force;
     if (saved.rpm === undefined) delete process.env.GEMCATCH_RPM;
     else process.env.GEMCATCH_RPM = saved.rpm;
-    ok('#3 SDK transport: submit -> poll -> completed and a friendly() error, via a stubbed @google/genai');
+    delete process.env.GEMCATCH_UPLOAD_POLL_MS;
+    ok('#3 SDK transport: submit -> poll -> completed, an upload, attachments and a friendly() error, via a stubbed @google/genai');
   }
 
   server.close();
