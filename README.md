@@ -103,6 +103,11 @@ Useful flags:
 | `-m, --model <id>` | `research`, `batch` | Override the model. |
 | `-a, --agent <id>` | `research`, `batch` | Submit to a [research agent](#research-agents) instead of a model. Mutually exclusive with `--model`. |
 | `--plan` | `research`, `batch` | Ask the agent for a [research plan](#see-the-plan-before-you-pay-for-the-run) first, to refine and approve. Needs `--agent`. |
+| `--attach <path\|url>` | `research`, `batch` | Give the agent a PDF, CSV or image ([your own data](#research-over-your-own-data)). Repeatable. Needs `--agent`. |
+| `--mcp <url>` | `research`, `batch` | Let the agent call a remote MCP server. Repeatable; `--mcp-header`, `--mcp-allow` and `--mcp-name` apply to the one before them. Needs `--agent`. |
+| `--file-search <store>` | `research`, `batch` | Let the agent search a File Search store. Repeatable. Needs `--agent`. |
+| `--no-web` | `research`, `batch` | Drop Google Search and URL Context, so the agent reads only what you gave it. Needs `--agent`. |
+| `--visualize` | `research`, `batch` | Let the agent draw charts; they're saved as image files. Needs `--agent`. |
 | `--yes` | `research`, `batch`, `refine`, `approve` | Confirm the agent cost without asking. Required for `--agent` when stdin is not a TTY. |
 | `-s, --system <text>` | `research`, `batch` | Set a system instruction. |
 | `-f, --file <path>` | `research` | Read the prompt from a file. |
@@ -282,6 +287,81 @@ $ gemcatch export --tag batch-1a2b3c -o reports.md                  # every repo
 
 Drop `--plan` and the first two lines become the 0.4.0 one-shot flow, which still works exactly as it did.
 
+## Research over your own data
+
+Out of the box a Deep Research agent reads the public web. These flags hand it your files, your MCP servers and your File Search stores as well, and `--visualize` lets it draw charts. They are agent features, so every one of them needs `--agent`. Without it gemcatch stops with one line naming the flag and sends nothing.
+
+### Files: `--attach`
+
+```console
+$ gemcatch research "Which region is growing fastest, and does the board pack agree?" --agent deep-research \
+    --attach sales-2026.csv --attach q3-board-pack.pdf --attach whiteboard.png \
+    --attach customer-contracts-2026.pdf --yes
+Attachments: sales-2026.csv (inline, 1 KB); q3-board-pack.pdf (inline, 1 KB); whiteboard.png (inline, 1 KB); customer-contracts-2026.pdf (upload, 40.0 MB)
+Agent deep-research-preview-04-2026 — estimated $1.00–$3.00 for this task (preview rates, subject to change).
+Uploading customer-contracts-2026.pdf (40.0 MB) to the Files API...
+Task 7cf00c5b submitted. Run: gemcatch get 7cf00c5b when ready.
+```
+
+PDF and CSV go in as documents; PNG, JPEG, WebP, HEIC, HEIF, GIF and BMP as images. The type comes from the extension, and anything else is refused before you're asked to pay, with a nudge to export a Word file as PDF or a spreadsheet as CSV. `--attach` also takes an https URL, which is passed to the agent by reference. A URL with no supported extension (arxiv's `https://arxiv.org/pdf/1706.03762`, say) gets one HEAD request to read its Content-Type, or a one-byte GET if the server refuses HEAD. The query string of a signed URL is sent as given and shown as `***` everywhere else, the store included.
+
+Local files are sent inline, in the order given, as long as the request stays under the API's inline limit: 100 MB of base64, or 50 MB once a PDF is in it. The first file that doesn't fit, and every file after it, goes up through the Files API instead and is referenced by URI. Google keeps uploads for 48 hours. On a `--plan` run gemcatch prints when they expire, and a `refine` or `approve` after that gets a warning. A file given twice is sent once.
+
+In a `batch` with more than one prompt, every local file is uploaded, once, and each prompt points at the upload. Inline bytes would otherwise go over the wire again with every prompt.
+
+Files go with the first turn only. A `refine` or `approve` continues the same conversation, and the files are already in it.
+
+### MCP servers: `--mcp`
+
+```console
+$ gemcatch research "Which accounts are at risk of churn this quarter?" --agent deep-research --plan --yes \
+    --mcp https://mcp.example-crm.com/mcp \
+    --mcp-header 'Authorization: Bearer ${CRM_TOKEN}' \
+    --mcp-allow search_accounts,get_account
+Tools: google_search; url_context; code_execution; MCP mcp.example-crm.com https://mcp.example-crm.com/mcp (Authorization: ***) [search_accounts, get_account]
+Agent deep-research-preview-04-2026 (planning turn) — estimated $1.00–$3.00 for this task (preview rates, subject to change; the docs price per task and do not price a planning turn separately).
+Plan task 5451f8b9 submitted. Run: gemcatch get 5451f8b9 when ready.
+```
+
+`--mcp` is repeatable, and `--mcp-header`, `--mcp-allow` and `--mcp-name` apply to the `--mcp` just before them. The server is named after its host unless you pass `--mcp-name`, and two servers on one host become `host` and `host-2`. Giving two servers the same `--mcp-name`, or one server the same header twice, is refused. Google's servers make the call, not your machine, so the URL has to be reachable from the internet; a localhost or private address gets a warning, and so does a plain `http://` URL that carries credentials.
+
+Header values, and any user, password, query string or fragment in an MCP URL, never appear in anything gemcatch prints: the confirmation, `--dry-run`, `list --json`, `get --raw` and API errors all show `***`.
+
+Note the single quotes in the example. gemcatch reads `${CRM_TOKEN}` from the environment itself, each time a turn is sent, so `tasks.db` only ever holds the reference. A `refine` or `approve` needs the variable set too, and stops in one line naming it if it isn't. A value written out in full, or expanded by your shell, is stored as given, because a later turn has to send it again. On Linux and macOS gemcatch keeps `~/.gemcatch` readable by you alone.
+
+### File Search stores: `--file-search`
+
+```console
+$ gemcatch research "What does our playbook say about discounting?" --agent deep-research \
+    --file-search sales-playbooks --no-web --dry-run
+Tools: code_execution; File Search fileSearchStores/sales-playbooks
+Agent deep-research-preview-04-2026 — estimated $1.00–$3.00 for this task. Nothing submitted (--dry-run).
+```
+
+Repeat it for more stores; they all go in one `file_search` tool. A bare name gets `fileSearchStores/` put in front of it. gemcatch doesn't create or fill stores, [the File Search docs](https://ai.google.dev/gemini-api/docs/file-search) cover that.
+
+### Charts: `--visualize`
+
+```console
+$ gemcatch research "Which region is growing fastest, and does the board pack agree?" --agent deep-research \
+    --attach sales-2026.csv --visualize --yes -w
+...
+(report text)
+
+Images:
+  /home/you/.gemcatch/images/7cf00c5b-1.png
+```
+
+This sets `agent_config.visualization` to `auto`, next to `collaborative_planning` when you also pass `--plan`. The charts in the final report are written to the data directory's `images/` folder as `<task-id>-<n>.<ext>`, and listed under the report by `get`, `watch` and `digest`, and as `images` in `--json`. `export -o report.md` copies them next to the export and links them in the Markdown. `rm` and `prune` delete them with the task.
+
+### What the agent can reach: `--no-web`
+
+With no source flags gemcatch sends no `tools` field and the agent gets its defaults: Google Search, URL Context and Code Execution. The API reads an explicit list as the whole set, so once you add `--mcp` or `--file-search`, gemcatch lists those three back in alongside your sources. `--attach` alone sends no list at all, since a file isn't a tool.
+
+`--no-web` drops Google Search and URL Context, so the agent works only from what you gave it. Code Execution stays: it can't reach the web, and it's what the agent uses to crunch a CSV and draw a chart. On its own `--no-web` is refused, because it would leave the agent nothing to read.
+
+`refine` and `approve` send the plan's tools and visualization setting again, so every turn of a chain reaches the same sources. Once a task in the listing used any of this, `list` grows a SOURCES column (`mcp`, `store`, `no-web`, `2 files`, `charts`).
+
 ## How it works
 
 Tasks live in SQLite at `~/.gemcatch/tasks.db` (override with `GEMCATCH_HOME`):
@@ -290,7 +370,8 @@ Tasks live in SQLite at `~/.gemcatch/tasks.db` (override with `GEMCATCH_HOME`):
 CREATE TABLE tasks (id TEXT PRIMARY KEY, prompt TEXT, interaction_id TEXT,
                     status TEXT DEFAULT 'pending', result TEXT, created_at INTEGER);
 -- plus model, system_instruction, tag, error, usage, updated_at, agent, citations,
---      collaborative_planning, previous_interaction_id, kind, parent_id
+--      collaborative_planning, previous_interaction_id, kind, parent_id,
+--      tools_json, attachments_json, visualization, images_json
 ```
 
 `research` calls `interactions.create({model, input, background: true})` via [`@google/genai`](https://www.npmjs.com/package/@google/genai) and keeps the returned `id`. The polling commands call `interactions.get(id)` and write the status back. Once a task completes, the text is cached in the `result` column — `gemcatch get` then answers from disk without touching the network.
@@ -340,6 +421,7 @@ Transient failures are retried with exponential backoff and full jitter, honouri
 | `GEMCATCH_HOME` | Where `tasks.db` lives. Default `~/.gemcatch`. |
 | `GEMCATCH_MODEL` | Default model. Default `gemini-3.5-flash-lite`. |
 | `GEMCATCH_POLL_MS` | `watch` poll interval in ms. Default `10000`. |
+| `GEMCATCH_UPLOAD_POLL_MS` | How often an upload still being processed by the Files API is checked, in ms. Default `2000`. |
 | `GEMCATCH_DAEMON_S` | `daemon` interval in seconds. Default `300`. |
 | `GEMCATCH_RPM` | Requests/minute ceiling. Default `15` (the free tier). `0` disables pacing. |
 | `GEMCATCH_MAX_RETRIES` | Extra attempts on a transient failure. Default `4`. `0` disables retries. |

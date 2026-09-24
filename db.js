@@ -42,6 +42,15 @@ const MIGRATIONS = [
   ['previous_interaction_id', 'TEXT'],
   ['kind', "TEXT DEFAULT 'task'"],
   ['parent_id', 'TEXT'],
+  // 0.6.0: sources. `tools_json` is the tools array the row was submitted with
+  // (header values included, so it is masked wherever it is printed);
+  // `attachments_json` records what was attached on this turn, never the bytes;
+  // `visualization` is the agent_config value; `images_json` lists the image
+  // files saved from the result. All NULL for a run that used none of them.
+  ['tools_json', 'TEXT'],
+  ['attachments_json', 'TEXT'],
+  ['visualization', 'TEXT'],
+  ['images_json', 'TEXT'],
 ];
 
 let _db = null;
@@ -57,8 +66,18 @@ function migrate(d) {
 
 function db() {
   if (_db) return _db;
-  fs.mkdirSync(HOME, { recursive: true });
+  const created = fs.mkdirSync(HOME, { recursive: true, mode: 0o700 });
   _db = new Database(DB_PATH);
+  // Rows can hold MCP header values. mkdir's mode only applies to a new
+  // directory, so an existing ~/.gemcatch is tightened too; a GEMCATCH_HOME the
+  // user already had is left alone. SQLite gives the -wal and -shm files the
+  // database file's mode. Best effort: some mounts refuse chmod.
+  if (process.platform !== 'win32') {
+    try {
+      if (!created && !process.env.GEMCATCH_HOME) fs.chmodSync(HOME, 0o700);
+      fs.chmodSync(DB_PATH, 0o600);
+    } catch (_) {}
+  }
   _db.pragma('journal_mode = WAL');
   _db.exec(BASE_SCHEMA);
   migrate(_db);
@@ -76,9 +95,11 @@ function createTask(fields) {
   db()
     .prepare(
       'INSERT INTO tasks (id, prompt, status, created_at, updated_at, model, system_instruction, tag, agent, ' +
-        'kind, parent_id, collaborative_planning, previous_interaction_id) ' +
+        'kind, parent_id, collaborative_planning, previous_interaction_id, ' +
+        'tools_json, attachments_json, visualization, images_json) ' +
         'VALUES (@id, @prompt, @status, @now, @now, @model, @system_instruction, @tag, @agent, ' +
-        '@kind, @parent_id, @collaborative_planning, @previous_interaction_id)'
+        '@kind, @parent_id, @collaborative_planning, @previous_interaction_id, ' +
+        '@tools_json, @attachments_json, @visualization, @images_json)'
     )
     .run({
       id,
@@ -95,6 +116,10 @@ function createTask(fields) {
       // must be stored as 0, while a run that sends no agent_config stores NULL.
       collaborative_planning: t.collaborativePlanning === undefined ? null : Number(!!t.collaborativePlanning),
       previous_interaction_id: t.previousInteractionId || null,
+      tools_json: t.toolsJson || null,
+      attachments_json: t.attachmentsJson || null,
+      visualization: t.visualization || null,
+      images_json: t.imagesJson || null,
     });
   return id;
 }
@@ -126,7 +151,7 @@ function setStatus(id, status, extra) {
   const e = extra || {};
   const sets = ['status = @status', 'updated_at = @now'];
   const params = { id, status, now: Date.now() };
-  for (const key of ['result', 'error', 'usage', 'citations']) {
+  for (const key of ['result', 'error', 'usage', 'citations', 'images_json']) {
     if (e[key] !== undefined) {
       sets.push(`${key} = @${key}`);
       params[key] = e[key];

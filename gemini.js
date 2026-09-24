@@ -1,6 +1,9 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const { isDone, isSuccess } = require('./status');
+const { redactText } = require('./sources');
 
 // Free of charge on the Gemini free tier; override per-call with --model.
 // gemini-3.5-flash-lite went GA on 2026-07-21 (it replaced 3.1 as the
@@ -48,6 +51,9 @@ function resolveAgent(id) {
 // Overridable for tests and for routing via a proxy/gateway.
 const REST_BASE =
   process.env.GEMCATCH_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/interactions';
+// The Files API shares the Interactions API's version root, with uploads under
+// /upload/<version>/files. Derived from REST_BASE so a gateway moves both.
+const API_ROOT = REST_BASE.replace(/\/interactions\/?$/, '');
 
 function envNum(name, dflt) {
   const raw = process.env[name];
@@ -195,21 +201,25 @@ async function call(fn) {
 
 // --- response shaping -----------------------------------------------------
 
+// Depth-first over every object in a response. `citations` subtrees are
+// sources *about* the answer, not answer content: an agent step carries them
+// alongside its content, and a citation's own title/snippet must not be read as
+// answer text, so the walk never enters them. They are collected separately.
+function walk(node, visit, skip = (k) => k === 'citations') {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    for (const n of node) walk(n, visit, skip);
+    return;
+  }
+  visit(node);
+  for (const [k, v] of Object.entries(node)) if (!skip(k, v)) walk(v, visit, skip);
+}
+
 // output_text is added by the SDK, so REST responses need text pulled from steps.
 function collectText(node, acc) {
-  if (!node || typeof node !== 'object') return acc;
-  if (Array.isArray(node)) {
-    for (const n of node) collectText(n, acc);
-    return acc;
-  }
-  if (typeof node.text === 'string' && node.text.trim()) acc.push(node.text);
-  for (const [k, v] of Object.entries(node)) {
-    // Citations are sources *about* the answer, not answer text: an agent step
-    // carries them alongside its content, and a citation's own title/snippet
-    // must not be concatenated into the result. They are collected separately.
-    if (k === 'citations') continue;
-    if (v && typeof v === 'object') collectText(v, acc);
-  }
+  walk(node, (n) => {
+    if (typeof n.text === 'string' && n.text.trim()) acc.push(n.text);
+  });
   return acc;
 }
 
@@ -230,9 +240,12 @@ function collectText(node, acc) {
 // silently blank result.
 const NON_ANSWER_STEP = new Set(['user_input', 'thought']);
 
+function answerSteps(steps) {
+  return Array.isArray(steps) ? steps.filter((s) => !(s && NON_ANSWER_STEP.has(s.type))) : [];
+}
+
 function textFromSteps(steps) {
-  if (!Array.isArray(steps)) return '';
-  const candidates = steps.filter((s) => !(s && NON_ANSWER_STEP.has(s.type)));
+  const candidates = answerSteps(steps);
   if (!candidates.length) return '';
   const last = collectText(candidates[candidates.length - 1], []).join('\n').trim();
   if (last) return last;
@@ -246,18 +259,10 @@ function textFromSteps(steps) {
 // walk is shape-agnostic (any `citations` array anywhere in the interaction),
 // because the docs do not pin down where they attach; duplicates are dropped.
 function collectCitations(node, acc) {
-  if (!node || typeof node !== 'object') return acc;
-  if (Array.isArray(node)) {
-    for (const n of node) collectCitations(n, acc);
-    return acc;
-  }
-  for (const [k, v] of Object.entries(node)) {
-    if (k === 'citations' && Array.isArray(v)) {
-      for (const c of v) if (c && typeof c === 'object') acc.push(c);
-      continue;
-    }
-    if (v && typeof v === 'object') collectCitations(v, acc);
-  }
+  walk(node, (n) => {
+    if (!Array.isArray(n.citations)) return;
+    for (const c of n.citations) if (c && typeof c === 'object') acc.push(c);
+  }, (k, v) => k === 'citations' && Array.isArray(v));
   return acc;
 }
 
@@ -283,11 +288,26 @@ function textOf(interaction) {
   return textFromSteps(interaction && interaction.steps);
 }
 
+// With agent_config.visualization the agent's charts come back as image content
+// ({type:'image', data:<base64>, mime_type}) in the same final step as the
+// report. Interim drafts can carry images too, so only that step is read.
+function imagesOf(interaction) {
+  const candidates = answerSteps(interaction && interaction.steps);
+  const images = [];
+  walk(candidates[candidates.length - 1], (n) => {
+    if (n.type === 'image' && typeof n.data === 'string' && n.data) {
+      images.push({ data: n.data, mime_type: n.mime_type || 'image/png' });
+    }
+  });
+  return images;
+}
+
 function shape(r) {
   return {
     interactionId: r.id,
     status: r.status,
     text: textOf(r),
+    images: imagesOf(r),
     citations: citationsOf(r),
     usage: r.usage || null,
     raw: r,
@@ -296,30 +316,40 @@ function shape(r) {
 
 // --- transports -----------------------------------------------------------
 
-let _api;
+let _client;
 
-function sdkInteractions() {
+function sdkClient() {
   // GEMCATCH_FORCE_REST exercises the raw-fetch fallback without uninstalling the
   // SDK. Checked every call so it always wins over the memo below.
   if (process.env.GEMCATCH_FORCE_REST === '1') return null;
-  if (_api !== undefined) return _api;
+  if (_client !== undefined) return _client;
   let GoogleGenAI;
   try {
     ({ GoogleGenAI } = require('@google/genai'));
   } catch (_) {
-    _api = null;
-    return _api;
+    _client = null;
+    return _client;
   }
   // apiKey() throws before the memo is written, so a missing key keeps
   // reporting itself instead of being cached as "no SDK".
-  const client = new GoogleGenAI({ apiKey: apiKey() });
-  const i = client.interactions;
-  // Only use the SDK if background is genuinely first-class here.
-  _api = i && typeof i.create === 'function' && typeof i.get === 'function' ? i : null;
-  return _api;
+  _client = new GoogleGenAI({ apiKey: apiKey() });
+  return _client;
 }
 
-async function restJson(url, init) {
+function sdkInteractions() {
+  const c = sdkClient();
+  const i = c && c.interactions;
+  // Only use the SDK if background is genuinely first-class here.
+  return i && typeof i.create === 'function' && typeof i.get === 'function' ? i : null;
+}
+
+function sdkFiles() {
+  const c = sdkClient();
+  const f = c && c.files;
+  return f && typeof f.upload === 'function' && typeof f.get === 'function' ? f : null;
+}
+
+async function restRequest(url, init) {
   let res;
   try {
     res = await fetch(url, init);
@@ -345,7 +375,11 @@ async function restJson(url, init) {
     }
   }
   if (!res.ok) throw apiError(res.status, body, res.headers);
-  return Array.isArray(body) ? body[0] : body;
+  return { body: Array.isArray(body) ? body[0] : body, headers: res.headers };
+}
+
+async function restJson(url, init) {
+  return (await restRequest(url, init)).body;
 }
 
 // NOTE: the API key goes in x-goog-api-key. `Authorization: Bearer <key>` is
@@ -360,34 +394,108 @@ async function submit(prompt, opts) {
   const o = opts || {};
   // `agent` and `model` are mutually exclusive on create: an agent run is sent
   // with `agent` INSTEAD of `model` (the agent picks its own models). `input`
-  // stays a plain string and `background` stays true either way -- agents
-  // *require* background execution, which gemcatch has always set.
+  // stays a plain string unless files are attached, and `background` stays true
+  // either way -- agents *require* background execution, which gemcatch has
+  // always set.
+  const input = o.attachments && o.attachments.length ? [{ type: 'text', text: prompt }, ...o.attachments] : prompt;
   const body = o.agent
-    ? { agent: o.agent, input: prompt, background: true }
-    : { model: o.model || DEFAULT_MODEL, input: prompt, background: true };
+    ? { agent: o.agent, input, background: true }
+    : { model: o.model || DEFAULT_MODEL, input, background: true };
   if (o.systemInstruction) body.system_instruction = o.systemInstruction;
+  // An explicit tools list replaces the agent's defaults, so it is sent only
+  // when the user named a source; a plain run leaves the field out entirely.
+  if (o.tools) body.tools = o.tools;
   // collaborative_planning is an `agent_config` field, NOT a top-level one, and
   // the docs send the whole block (type + thinking_summaries) with it. Sent only
-  // when a plan turn is involved -- agent_config is optional otherwise, so an
-  // ordinary run keeps making exactly the request it always made. Presence, not
-  // truthiness: `false` is the approval turn's real value and must reach the API.
-  if (o.collaborativePlanning !== undefined) {
-    body.agent_config = {
-      type: AGENT_CONFIG_TYPE,
-      thinking_summaries: 'auto',
-      collaborative_planning: !!o.collaborativePlanning,
-    };
+  // when a plan turn or visualization is involved -- agent_config is optional
+  // otherwise, so an ordinary run keeps making exactly the request it always
+  // made. Presence, not truthiness: `false` is the approval turn's real value
+  // and must reach the API.
+  if (o.collaborativePlanning !== undefined || o.visualization) {
+    body.agent_config = { type: AGENT_CONFIG_TYPE };
+    if (o.collaborativePlanning !== undefined) {
+      body.agent_config.thinking_summaries = 'auto';
+      body.agent_config.collaborative_planning = !!o.collaborativePlanning;
+    }
+    if (o.visualization) body.agent_config.visualization = o.visualization;
   }
   // Continues an earlier interaction server-side: the plan is already in that
   // conversation, so this turn sends only what changed.
   if (o.previousInteractionId) body.previous_interaction_id = o.previousInteractionId;
-  const r = await call(() => {
-    const api = sdkInteractions();
-    return api
-      ? api.create(body)
-      : restJson(REST_BASE, { method: 'POST', headers: restHeaders(), body: JSON.stringify(body) });
-  });
+  let r;
+  try {
+    r = await call(() => {
+      const api = sdkInteractions();
+      return api
+        ? api.create(body)
+        : restJson(REST_BASE, { method: 'POST', headers: restHeaders(), body: JSON.stringify(body) });
+    });
+  } catch (err) {
+    // A 400 can quote the request back; MCP header values are credentials.
+    const urls = (o.attachments || []).map((a) => a.uri).filter(Boolean);
+    err.message = redactText(err.message, o.tools, urls);
+    throw err;
+  }
   return shape(r);
+}
+
+// Google's resumable upload, in its single-request form: start a session, then
+// send every byte and finalize in one go. Returns the File resource.
+async function restUpload(filePath, mime) {
+  const blob = await fs.openAsBlob(filePath, { type: mime });
+  const root = new URL(API_ROOT);
+  const start = await restRequest(`${root.origin}/upload${root.pathname.replace(/\/$/, '')}/files`, {
+    method: 'POST',
+    headers: {
+      ...restHeaders(),
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(blob.size),
+      'X-Goog-Upload-Header-Content-Type': mime,
+    },
+    body: JSON.stringify({ file: { display_name: path.basename(filePath) } }),
+  });
+  const session = start.headers.get('x-goog-upload-url');
+  if (!session) {
+    const e = new Error('the Files API did not return an upload URL');
+    e.code = 'NETWORK';
+    throw e;
+  }
+  const done = await restJson(session, {
+    method: 'POST',
+    headers: { 'X-Goog-Upload-Offset': '0', 'X-Goog-Upload-Command': 'upload, finalize' },
+    body: blob,
+  });
+  return (done && done.file) || done;
+}
+
+const UPLOAD_POLL_MS = envNum('GEMCATCH_UPLOAD_POLL_MS', 2000);
+const UPLOAD_WAIT_MS = 10 * 60 * 1000;
+
+// Uploads a local file through the Files API and waits until it can be used.
+// Resolves to {uri, expiresAt} (ms since epoch; Google keeps files 48 hours).
+async function upload(filePath, mime) {
+  let file = await call(() => {
+    const files = sdkFiles();
+    return files
+      ? files.upload({ file: filePath, config: { mimeType: mime, displayName: path.basename(filePath) } })
+      : restUpload(filePath, mime);
+  });
+  const failed = (why) => Object.assign(new Error(`upload of ${path.basename(filePath)} failed: ${why}`), { code: 'UPLOAD_FAILED' });
+  const deadline = Date.now() + UPLOAD_WAIT_MS;
+  while (file && file.state === 'PROCESSING') {
+    if (Date.now() > deadline) throw failed(`still processing after ${UPLOAD_WAIT_MS / 60000} minutes`);
+    await sleep(UPLOAD_POLL_MS);
+    const name = file.name;
+    file = await call(() => {
+      const files = sdkFiles();
+      return files ? files.get({ name }) : restJson(`${API_ROOT}/${name}`, { method: 'GET', headers: restHeaders() });
+    });
+  }
+  if (!file || !file.uri || file.state === 'FAILED') {
+    throw failed((file && file.error && file.error.message) || 'no usable file came back');
+  }
+  return { uri: file.uri, expiresAt: Date.parse(file.expirationTime) || null };
 }
 
 async function poll(interactionId) {
@@ -438,6 +546,7 @@ module.exports = {
   AGENT_CONFIG_TYPE,
   resolveAgent,
   submit,
+  upload,
   poll,
   cancel,
   remove,
