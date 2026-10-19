@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-19
+
+### Changed
+
+- Update the Google GenAI SDK to 2.23.0 and refresh its reviewed install-script approval.
+
 ## [0.6.0] - 2026-09-24
 
 ### Added
